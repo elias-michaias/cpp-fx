@@ -222,6 +222,69 @@ template <typename F> struct FxAwaitable {
   decltype(auto) await_resume() { return inner._run(); }
 };
 
+// always_false_v: dependent false for static_assert in constrained templates.
+// Must depend on a template parameter so the assert only fires at instantiation.
+template <typename...> inline constexpr bool always_false_v = false;
+
+// Shared promise_type base for Fx<T> and Fx<void>.
+// Holds the coroutine state and all await_transform overloads in one place.
+template <typename... Es> struct PromiseBase {
+  std::exception_ptr exception;
+  const void *effect_tag = nullptr;
+  void *payload_ptr = nullptr;
+
+  std::suspend_always initial_suspend() noexcept { return {}; }
+  std::suspend_always final_suspend() noexcept { return {}; }
+  void unhandled_exception() { exception = std::current_exception(); }
+  using declared_effects = type_list<Es...>;
+
+  // Declared effect — allowed.
+  template <Effectful Eff>
+    requires contains_in_list_v<Eff, type_list<Es...>>
+  PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept {
+    return a;
+  }
+
+  // Undeclared effect — deleted so IDEs squiggle at the perform() call site.
+  // To fix: add E to the return type: E::Fx<T>  or  Row<..., E>::Fx<T>.
+  template <Effectful Eff>
+  PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
+
+  // Inner Fx propagation — all inner effects are declared here, so allowed.
+  template <typename T2, Effectful... InnerEs>
+    requires all_in_v<type_list<InnerEs...>, Es...>
+  FxAwaitable<Fx<T2, InnerEs...>>
+  await_transform(Fx<T2, InnerEs...> inner) noexcept { return {std::move(inner)}; }
+
+  // Inner Fx has undeclared effects — deleted for IDE squiggles at co_await site.
+  // To fix: add the missing effect(s) to the return type: Row<..., E>::Fx<T>.
+  template <typename T2, Effectful... InnerEs>
+    requires(!all_in_v<type_list<InnerEs...>, Es...>)
+  FxAwaitable<Fx<T2, InnerEs...>> await_transform(Fx<T2, InnerEs...>) = delete;
+};
+
+// RAII coroutine handle — owns the handle and destroys it on scope exit.
+template <typename Promise> struct OwnedHandle {
+  std::coroutine_handle<Promise> h;
+  OwnedHandle() = default;
+  explicit OwnedHandle(std::coroutine_handle<Promise> h_) noexcept : h(h_) {}
+  OwnedHandle(OwnedHandle &&o) noexcept : h(std::exchange(o.h, {})) {}
+  OwnedHandle &operator=(OwnedHandle &&o) noexcept {
+    if (this != &o) {
+      if (h)
+        h.destroy();
+      h = std::exchange(o.h, {});
+    }
+    return *this;
+  }
+  OwnedHandle(const OwnedHandle &) = delete;
+  OwnedHandle &operator=(const OwnedHandle &) = delete;
+  ~OwnedHandle() {
+    if (h)
+      h.destroy();
+  }
+};
+
 } // namespace detail
 
 template <Effectful E, typename T, Effectful... Es>
@@ -263,74 +326,17 @@ struct ScopedHandler {
 
 template <typename T, Effectful... Es> class Fx {
 public:
-  struct promise_type {
+  struct promise_type : detail::PromiseBase<Es...> {
     std::optional<T> result;
-    std::exception_ptr exception;
-    const void *effect_tag = nullptr;
-    void *payload_ptr = nullptr;
-
     Fx get_return_object() noexcept;
-    std::suspend_always initial_suspend() noexcept { return {}; }
-    std::suspend_always final_suspend() noexcept { return {}; }
     void return_value(T v) { result = std::move(v); }
-    void unhandled_exception() { exception = std::current_exception(); }
-    using declared_effects = detail::type_list<Es...>;
-
-    // Valid: effect is declared in this Fx's return type.
-    template <Effectful Eff>
-      requires detail::contains_in_list_v<Eff, detail::type_list<Es...>>
-    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept {
-      return a;
-    }
-
-    // Invalid: effect not declared — deleted so IDEs squiggle at the perform()
-    // call. To fix: add EffectType to the return type: E::Fx<T> or Row<..., E>::Fx<T>.
-    template <Effectful Eff>
-    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
-
-    // co_await inner_fx: run an inner effectful computation, propagating its
-    // effects. All of the inner Fx's effects must appear in this function's
-    // return type.
-    template <typename T2, Effectful... InnerEs>
-      requires detail::all_in_v<detail::type_list<InnerEs...>, Es...>
-    detail::FxAwaitable<Fx<T2, InnerEs...>>
-    await_transform(Fx<T2, InnerEs...> inner) noexcept {
-      return {std::move(inner)};
-    }
-
-    // Missing propagation: inner Fx has an effect not declared here — IDE
-    // squiggle. To fix: add the missing effect(s) to this function's return
-    // type.
-    template <typename T2, Effectful... InnerEs>
-      requires(!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
-    detail::FxAwaitable<Fx<T2, InnerEs...>>
-        await_transform(Fx<T2, InnerEs...>) = delete;
   };
   using Handle = std::coroutine_handle<promise_type>;
   using value_type = T;
   using effect_list = detail::type_list<Es...>;
 
 private:
-  struct OwnedHandle {
-    Handle h;
-    OwnedHandle() = default;
-    explicit OwnedHandle(Handle h) noexcept : h(h) {}
-    OwnedHandle(OwnedHandle &&o) noexcept : h(std::exchange(o.h, {})) {}
-    OwnedHandle &operator=(OwnedHandle &&o) noexcept {
-      if (this != &o) {
-        if (h)
-          h.destroy();
-        h = std::exchange(o.h, {});
-      }
-      return *this;
-    }
-    OwnedHandle(const OwnedHandle &) = delete;
-    OwnedHandle &operator=(const OwnedHandle &) = delete;
-    ~OwnedHandle() {
-      if (h)
-        h.destroy();
-    }
-  };
+  using OwnedHandle = detail::OwnedHandle<promise_type>;
 
   using Fn = std::move_only_function<T()>;
   using Impl = std::variant<OwnedHandle, Fn>;
@@ -363,7 +369,7 @@ private:
   }
 
   template <typename H, typename... Rest>
-  T run_composite(H &h, detail::type_list<>, Rest &...rest) {
+  T run_composite([[maybe_unused]] H &h, detail::type_list<>, Rest &...rest) {
     return run_impl(rest...);
   }
 
@@ -374,17 +380,25 @@ public:
   Fx(const Fx &) = delete;
   Fx &operator=(const Fx &) = delete;
 
-  // Runs the computation. Every effect in Es... must be covered by a
-  // TypedHandler or CompositeHandler; a missing handler is a compile error.
-  // With no declared effects, call as .run() with no arguments.
+  // Runs the computation. Each effect in Es... must have a matching handler.
+  // All declared effects must have a matching handler.
+  // If any effect is unhandled the deleted overload is selected, producing
+  // an IDE squiggle and a "use of deleted function" error at the call site.
   template <typename... Hs>
     requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
   T run(Hs &&...hs) {
+    // Store handlers so temporaries outlive _run().
     auto locals = std::make_tuple(std::forward<Hs>(hs)...);
     return std::apply(
         [this](auto &...local_hs) -> T { return run_impl(local_hs...); },
         locals);
   }
+
+  // Selected when any declared effect lacks a handler.
+  // Add a handler for every effect listed in the return type.
+  template <typename... Hs>
+    requires (!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
+  T run(Hs &&...) = delete;
 
   T _run() {
     if (auto *fn = std::get_if<Fn>(&impl_))
@@ -411,64 +425,16 @@ Fx<T, Es...> Fx<T, Es...>::promise_type::get_return_object() noexcept {
 
 template <Effectful... Es> class Fx<void, Es...> {
 public:
-  struct promise_type {
-    std::exception_ptr exception;
-    const void *effect_tag = nullptr;
-    void *payload_ptr = nullptr;
-
+  struct promise_type : detail::PromiseBase<Es...> {
     Fx get_return_object() noexcept;
-    std::suspend_always initial_suspend() noexcept { return {}; }
-    std::suspend_always final_suspend() noexcept { return {}; }
     void return_void() {}
-    void unhandled_exception() { exception = std::current_exception(); }
-    using declared_effects = detail::type_list<Es...>;
-
-    template <Effectful Eff>
-      requires detail::contains_in_list_v<Eff, detail::type_list<Es...>>
-    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept {
-      return a;
-    }
-
-    template <Effectful Eff>
-    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
-
-    template <typename T2, Effectful... InnerEs>
-      requires detail::all_in_v<detail::type_list<InnerEs...>, Es...>
-    detail::FxAwaitable<Fx<T2, InnerEs...>>
-    await_transform(Fx<T2, InnerEs...> inner) noexcept {
-      return {std::move(inner)};
-    }
-
-    template <typename T2, Effectful... InnerEs>
-      requires(!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
-    detail::FxAwaitable<Fx<T2, InnerEs...>>
-        await_transform(Fx<T2, InnerEs...>) = delete;
   };
   using Handle = std::coroutine_handle<promise_type>;
   using value_type = void;
   using effect_list = detail::type_list<Es...>;
 
 private:
-  struct OwnedHandle {
-    Handle h;
-    OwnedHandle() = default;
-    explicit OwnedHandle(Handle h) noexcept : h(h) {}
-    OwnedHandle(OwnedHandle &&o) noexcept : h(std::exchange(o.h, {})) {}
-    OwnedHandle &operator=(OwnedHandle &&o) noexcept {
-      if (this != &o) {
-        if (h)
-          h.destroy();
-        h = std::exchange(o.h, {});
-      }
-      return *this;
-    }
-    OwnedHandle(const OwnedHandle &) = delete;
-    OwnedHandle &operator=(const OwnedHandle &) = delete;
-    ~OwnedHandle() {
-      if (h)
-        h.destroy();
-    }
-  };
+  using OwnedHandle = detail::OwnedHandle<promise_type>;
 
   using Fn = std::move_only_function<void()>;
   using Impl = std::variant<OwnedHandle, Fn>;
@@ -497,7 +463,7 @@ private:
   }
 
   template <typename H, typename... Rest>
-  void run_composite(H &h, detail::type_list<>, Rest &...rest) {
+  void run_composite([[maybe_unused]] H &h, detail::type_list<>, Rest &...rest) {
     run_impl(rest...);
   }
 
@@ -514,6 +480,12 @@ public:
     auto locals = std::make_tuple(std::forward<Hs>(hs)...);
     std::apply([this](auto &...local_hs) { run_impl(local_hs...); }, locals);
   }
+
+  // Selected when any declared effect lacks a handler.
+  // Add a handler for every effect listed in the return type.
+  template <typename... Hs>
+    requires (!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
+  void run(Hs &&...) = delete;
 
   void _run() {
     if (auto *fn = std::get_if<Fn>(&impl_)) {
