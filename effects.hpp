@@ -29,6 +29,7 @@
 #include <coroutine>
 #include <exception>
 #include <functional>
+#include <memory_resource>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
@@ -91,7 +92,7 @@ auto handler(F &&fn) {
   return LambdaHandler<E, std::decay_t<F>>{std::forward<F>(fn)};
 }
 
-// --- Thread-local handler stack ---------------------------------------------
+// --- Thread-local handler stack and allocator --------------------------------
 
 namespace detail {
 
@@ -104,12 +105,37 @@ struct HandlerNode {
 
 inline thread_local HandlerNode *stack_top = nullptr;
 
+/// Active memory resource for this thread.  Null means use new/delete.
+/// Set via fx::ScopedAllocator — never write this directly.
+inline thread_local std::pmr::memory_resource *current_mr = nullptr;
+
 template <Effectful E> inline constexpr char effect_tag_v = 0;
 
 template <Effectful E> struct Payload {
   E effect_value;
   std::function<void(typename E::result_type)> resume;
 };
+
+/// Allocate one T using current_mr (or global new if none is installed).
+/// The object is move-constructed from `obj`.
+template <typename T> T *pmr_new(T obj) {
+  if (auto *mr = current_mr) {
+    void *raw = mr->allocate(sizeof(T), alignof(T));
+    return ::new (raw) T{std::move(obj)};
+  }
+  return new T{std::move(obj)};
+}
+
+/// Deallocate a T previously allocated by pmr_new using current_mr.
+/// Calls the destructor and returns memory to the active resource.
+template <typename T> void pmr_delete(T *ptr) noexcept {
+  if (auto *mr = current_mr) {
+    ptr->~T();
+    mr->deallocate(ptr, sizeof(T), alignof(T));
+  } else {
+    delete ptr;
+  }
+}
 
 inline void dispatch_effect(const void *tag, void *payload_ptr) {
   for (auto *n = stack_top; n; n = n->prev) {
@@ -290,6 +316,32 @@ template <typename... Es> struct PromiseBase {
   void unhandled_exception() { exception = std::current_exception(); }
   using declared_effects = type_list<Es...>;
 
+  // Coroutine frame allocation — honours the active ScopedAllocator.
+  // The memory resource pointer is appended after the frame so deallocation
+  // can always route back to the same resource even if the allocator changes.
+  static void *operator new(std::size_t n) {
+    constexpr std::size_t kPtrSize = sizeof(std::pmr::memory_resource *);
+    auto *mr = current_mr;
+    std::size_t total = n + kPtrSize;
+    void *raw = mr ? mr->allocate(total, alignof(std::max_align_t))
+                   : ::operator new(total);
+    // Store mr (or nullptr) immediately after the frame bytes.
+    *reinterpret_cast<std::pmr::memory_resource **>(
+        static_cast<std::byte *>(raw) + n) = mr;
+    return raw;
+  }
+
+  static void operator delete(void *ptr, std::size_t n) noexcept {
+    constexpr std::size_t kPtrSize = sizeof(std::pmr::memory_resource *);
+    std::size_t total = n + kPtrSize;
+    auto *mr = *reinterpret_cast<std::pmr::memory_resource **>(
+        static_cast<std::byte *>(ptr) + n);
+    if (mr)
+      mr->deallocate(ptr, total, alignof(std::max_align_t));
+    else
+      ::operator delete(ptr, total);
+  }
+
   // Declared effect — allowed.
   template <Effectful Eff>
     requires contains_in_list_v<Eff, type_list<Es...>>
@@ -363,7 +415,7 @@ struct ScopedHandler {
       auto *pl = reinterpret_cast<detail::Payload<E> *>(raw);
       std::function<void(R)> resume = [pl](R v) {
         auto fn = std::move(pl->resume);
-        delete pl;
+        detail::pmr_delete(pl);
         fn(std::move(v));
       };
       hh(pl->effect_value, std::move(resume));
@@ -375,6 +427,38 @@ struct ScopedHandler {
   ~ScopedHandler() { detail::stack_top = saved; }
   ScopedHandler(const ScopedHandler &) = delete;
   ScopedHandler &operator=(const ScopedHandler &) = delete;
+};
+
+// --- ScopedAllocator --------------------------------------------------------
+
+/// RAII guard that installs a `std::pmr::memory_resource` for the lifetime of
+/// the object.  While a `ScopedAllocator` is alive, all `perform()` payload
+/// allocations **and** coroutine frame allocations in the current thread use
+/// the supplied resource instead of the global `operator new`.
+///
+/// Resources are saved and restored when scopes nest, so multiple
+/// `ScopedAllocator` objects can be stacked safely.
+///
+/// Example — batch 10 000 performs through a 256 KiB arena:
+/// @code
+///   std::array<std::byte, 256*1024> buf;
+///   std::pmr::monotonic_buffer_resource arena{buf.data(), buf.size(),
+///                                             std::pmr::null_memory_resource()};
+///   fx::ScopedAllocator alloc{&arena};
+///   auto result = my_computation().run(my_handler);
+/// @endcode
+class ScopedAllocator {
+public:
+  explicit ScopedAllocator(std::pmr::memory_resource *mr) noexcept
+      : prev_(detail::current_mr) {
+    detail::current_mr = mr;
+  }
+  ~ScopedAllocator() noexcept { detail::current_mr = prev_; }
+  ScopedAllocator(const ScopedAllocator &) = delete;
+  ScopedAllocator &operator=(const ScopedAllocator &) = delete;
+
+private:
+  std::pmr::memory_resource *prev_;
 };
 
 // --- Fx<T, Es...> -----------------------------------------------------------
@@ -631,12 +715,12 @@ public:
   void await_suspend(std::coroutine_handle<Promise> caller) {
     using R = typename E::result_type;
 
-    auto *payload =
-        new detail::Payload<E>{.effect_value = std::move(effect_),
-                               .resume = [this, caller](R v) mutable {
-                                 result_ = std::move(v);
-                                 caller.resume();
-                               }};
+    auto *payload = detail::pmr_new(
+        detail::Payload<E>{.effect_value = std::move(effect_),
+                           .resume = [this, caller](R v) mutable {
+                             result_ = std::move(v);
+                             caller.resume();
+                           }});
 
     caller.promise().effect_tag = &detail::effect_tag_v<E>;
     caller.promise().payload_ptr = payload;
@@ -647,7 +731,7 @@ public:
         return;
       }
     }
-    delete payload;
+    detail::pmr_delete(payload);
     throw std::runtime_error("fx::perform -- no handler for this effect type");
   }
 

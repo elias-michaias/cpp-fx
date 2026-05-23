@@ -4,7 +4,7 @@ CXXFLAGS  = -std=c++23 -Wall -Wextra -O2
 SRCS = $(wildcard t*.cpp)
 BINS = $(SRCS:.cpp=)
 
-.PHONY: all run check-invalid clean
+.PHONY: all run check-invalid bench clean
 
 all: $(BINS)
 
@@ -31,5 +31,9 @@ check-invalid:
 	done; \
 	echo "$$pass correctly rejected, $$fail unexpected successes."
 
+bench:
+	@$(MAKE) -C benchmarks run
+
 clean:
 	rm -f $(BINS)
+	@$(MAKE) -C benchmarks clean
