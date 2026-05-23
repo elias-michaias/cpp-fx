@@ -40,7 +40,8 @@ using All = Combine<IO, Row<Fail>>;
 
 // --- 2. Computations --------------------------------------------------------
 //
-// Return types are now Fx<ReturnType, Effects...>.
+// Return types use E::Fx<T> for a single effect, Row<Es...>::Fx<T> for
+// multiple effects, or a named row alias (IO::Fx<T>, All::Fx<T>, etc.).
 // The declared effects are visible at every call site.
 
 let greet() -> IO::Fx<std::string> {
@@ -68,8 +69,8 @@ let collect(int n) -> Ask::Fx<std::vector<std::string>> {
 
 // --- Generic-effect functions -----------------------------------------------
 //
-// Emit<int>::Fx<void>  is identical to  Fx<void, Emit<int>>.
-// The :: notation is just syntactic sugar from the CRTP base.
+// Emit<T> is a template effect; Emit<T>::Fx<R> is just E::Fx<R> with a
+// template type argument — identical to Fx<R, Emit<T>> under the hood.
 
 // Leaf: emits every integer in [lo, hi).
 let range(int lo, int hi) -> Emit<int>::Fx<void> {
@@ -78,7 +79,7 @@ let range(int lo, int hi) -> Emit<int>::Fx<void> {
 }
 
 // Propagation: calls range (Emit<int> propagates up) and adds its own Log.
-let range_logged(int lo, int hi) -> Fx<void, Emit<int>, Log> {
+let range_logged(int lo, int hi) -> Row<Emit<int>, Log>::Fx<void> {
   perform(Log{.message = "emitting [" + std::to_string(lo) + ", " +
                          std::to_string(hi) + ")"});
   co_await range(lo, hi);
@@ -99,7 +100,7 @@ let sum_range(int lo, int hi) -> Fx<int> {
 
 // Two distinct specialisations: Emit<int> and Emit<std::string> are
 // completely separate effects and require separate handlers.
-let annotate(int lo, int hi) -> Fx<void, Emit<int>, Emit<std::string>> {
+let annotate(int lo, int hi) -> Row<Emit<int>, Emit<std::string>>::Fx<void> {
   for (int i = lo; i < hi; ++i) {
     perform(Emit<int>{.value = i * i});
     perform(Emit<std::string>{.value = std::to_string(i) + "\xc2\xb2"});
@@ -182,14 +183,14 @@ VALIDATE_HANDLER(WarnFail);
 
 // --- 5. Composition examples ------------------------------------------------
 //
-// Effects propagate upward: a function that co_awaits an inner Fx<T, Es...>
-// must declare all of Es... in its own return type.
+// Effects propagate upward: a function that co_awaits an inner Fx must
+// declare all of the inner function's effects in its own return type.
 //
 // Hierarchy used below:
-//   ask_once          : Fx<string, Ask>
-//   ask_and_log       : Fx<string, Ask, Log>   -- calls ask_once, adds Log
-//   safe_div_logged   : Fx<int, Log, Fail>      -- calls safe_div, adds Log
-//   compute_ratio     : Fx<string, Ask, Log, Fail> -- calls both of the above
+//   ask_once          : Ask::Fx<string>
+//   ask_and_log       : IO::Fx<string>            -- calls ask_once, adds Log
+//   safe_div_logged   : Row<Log, Fail>::Fx<int>   -- calls safe_div, adds Log
+//   compute_ratio     : All::Fx<string>           -- calls both of the above
 
 // Leaf: just wraps a single Ask.
 let ask_once(std::string prompt) -> Ask::Fx<std::string> {
@@ -232,8 +233,8 @@ let compute_ratio() -> All::Fx<std::string> {
 //   Pattern 3 — coroutine: absorb inner + add new effects of its own
 
 // Pattern 1a: silence logs — handle<Log> strips Log before the caller sees it.
-// ask_and_log : Fx<string, Ask, Log>
-// return type : Fx<string, Ask>        ← Log gone
+// ask_and_log : IO::Fx<string>
+// return type : Ask::Fx<string>   ← Log gone
 let ask_silently(std::string label, std::string prompt)
     -> Ask::Fx<std::string> {
   return handle<Log>(ask_and_log(std::move(label), std::move(prompt)),
@@ -241,16 +242,16 @@ let ask_silently(std::string label, std::string prompt)
 }
 
 // Pattern 1b: recover from failure — handle<Fail> strips Fail, returns 0.
-// safe_div_logged : Fx<int, Log, Fail>
-// return type     : Fx<int, Log>       ← Fail gone, Log propagates
+// safe_div_logged : Row<Log, Fail>::Fx<int>
+// return type     : Log::Fx<int>   ← Fail gone, Log propagates
 let safe_div_or_zero(int a, int b) -> Log::Fx<int> {
   return handle<Fail>(safe_div_logged(a, b),
                       handler<Fail>([](Fail, auto r) { r(0); }));
 }
 
 // Pattern 2: absorb all — chain two handle<> calls, return pure Fx<int>.
-// safe_div_logged : Fx<int, Log, Fail>
-// handle<Fail>    : Fx<int, Log>
+// safe_div_logged : Row<Log, Fail>::Fx<int>
+// handle<Fail>    : Log::Fx<int>
 // handle<Log>     : Fx<int>            ← no effects, .run() needs no handlers
 let silent_safe_div(int a, int b) -> Fx<int> {
   return handle<Log>(handle<Fail>(safe_div_logged(a, b),
@@ -260,12 +261,12 @@ let silent_safe_div(int a, int b) -> Fx<int> {
 
 // Pattern 3: coroutine that absorbs an inner effect and adds a new one.
 //
-// safe_div_logged : Fx<int, Log, Fail>
-// handle<Fail>(...): Fx<int, Log>      ← Fail absorbed with 0 fallback
+// safe_div_logged : Row<Log, Fail>::Fx<int>
+// handle<Fail>(...): Log::Fx<int>      ← Fail absorbed with 0 fallback
 // co_await that  : valid (Log ⊆ {Ask, Log})
 // ask_once       : adds Ask
 //
-// Net return type: Fx<int, Ask, Log>
+// Net return type: IO::Fx<int>
 //   Ask  — new (prompts for operands)
 //   Log  — propagated from safe_div_logged
 //   Fail — absorbed (never reaches caller)
@@ -283,7 +284,7 @@ int main() {
   // Demo 1: Real I/O with named handler structs.
   std::cout << "=== Demo 1: Real I/O ===\n";
   {
-    // greet() : Fx<string, Ask, Log>  -- both effects must be handled
+    // greet() : IO::Fx<string>  -- both effects must be handled
     let result = greet().run(StdinAsk{}, StdoutLog{});
     std::cout << result << "\n\n";
   }
@@ -303,7 +304,7 @@ int main() {
       resume({});
     });
 
-    // collect(3) : Fx<vector<string>, Ask>  -- only Ask needs a handler
+    // collect(3) : Ask::Fx<vector<string>>  -- only Ask needs a handler
     let names = collect(3).run(ask_mock, log_mock);
 
     std::cout << "Names:";
@@ -313,11 +314,11 @@ int main() {
   }
 
   // Demo 3: handle<E>() returns a reduced Fx with E removed from its type.
-  //   safe_div(10, 0) : Fx<int, Fail>
+  //   safe_div(10, 0) : Fail::Fx<int>
   //   handle<Fail>(...)  : Fx<int>     (no effects left -- .run() available)
   std::cout << "=== Demo 3: handle<E> chaining ===\n";
   {
-    //   safe_div(10, 0) : Fx<int, Fail>
+    //   safe_div(10, 0) : Fail::Fx<int>
     //   handle<Fail>(...)  : Fx<int>     (no effects left -- .run() available)
     std::cout << "10/0 = " << handle<Fail>(safe_div(10, 0), WarnFail{}).run()
               << "\n";
@@ -326,28 +327,27 @@ int main() {
   }
 
   // Demo 4: Chain handle<E> calls to peel effects one at a time.
-  //   greet() : Fx<string, Ask, Log>
-  //   handle<Log>(...) : Fx<string, Ask>
+  //   greet()          : IO::Fx<string>
+  //   handle<Log>(...) : Ask::Fx<string>
   //   handle<Ask>(...) : Fx<string>       (.run() now available)
   std::cout << "=== Demo 4: Chained handle<E> calls ===\n";
   {
     let fully_handled =
         handle<Ask>(handle<Log>(greet(), StdoutLog{}),
                     handler<Ask>([](Ask, auto r) { r(std::string{"World"}); }));
-    // fully_handled : Fx<string>  -- no effects, .run() is available
+    // fully_handled : Fx<string>  -- no effects remain, .run() is available
     std::cout << fully_handled.run() << "\n\n";
   }
 
   // Demo 5: Compile-time validation -- missing handler is a compile error.
   //   Uncomment to see the static_assert fire:
   //
-  //   rgreet().run(StdinAsk{});
+  //   greet().run(StdinAsk{});
   //   // error: fx::run -- not all effects are handled.
-  //   //        Provide a TypedHandler for every effect declared in Fx<T,
-  //   Effects...>.
+  //   //        Provide a handler for every effect in the return type.
   //
   //   handle<Ask>(safe_div(10, 0), StdinAsk{});
-  //   // error: constraint not satisfied -- Ask is not in Fx<int, Fail>'s
+  //   // error: constraint not satisfied -- Ask is not in Fail::Fx<int>'s
   //   effect set.
   std::cout << "=== Demo 5: Swappable interpretations ===\n";
   {
@@ -466,7 +466,7 @@ int main() {
   // Ask.
   std::cout << "=== Demo 11: Absorb Log locally (Ask still propagates) ===\n";
   {
-    // ask_silently : Fx<string, Ask>  — Log handled internally (silenced)
+    // ask_silently : Ask::Fx<string>  — Log handled internally (silenced)
     let answer =
         ask_silently("city", "Your city: ").run(handler<Ask>([](Ask e, auto r) {
           std::cout << e.prompt << "London\n";
@@ -479,7 +479,7 @@ int main() {
   // needs Log.
   std::cout << "=== Demo 12: Absorb Fail locally (Log still propagates) ===\n";
   {
-    // safe_div_or_zero : Fx<int, Log>  — Fail recovered with 0, Log propagates
+    // safe_div_or_zero : Log::Fx<int>  — Fail recovered with 0, Log propagates
     let log_h = handler<Log>([](Log e, auto r) {
       std::cout << "[log] " << e.message << "\n";
       r({});
@@ -501,7 +501,7 @@ int main() {
   // Demo 14: Pattern 3 — coroutine absorbs Fail, adds Ask, propagates Log.
   std::cout << "=== Demo 14: Absorb Fail, add Ask, propagate Log ===\n";
   {
-    // prompted_safe_div : Fx<int, Ask, Log>
+    // prompted_safe_div : IO::Fx<int>
     //   Ask  propagates (this function asks for operands)
     //   Log  propagates (from safe_div_logged deep inside)
     //   Fail absorbed   (handled locally with 0 fallback — never reaches
@@ -541,7 +541,8 @@ int main() {
   }
 
   // Demo 16: Emit<int> propagates through range_logged alongside Log.
-  //   range_logged : Fx<void, Emit<int>, Log> — both effects reach the caller.
+  //   range_logged : Row<Emit<int>, Log>::Fx<void> — both effects reach the
+  //   caller.
   std::cout << "=== Demo 16: Emit<int> propagates (alongside Log) ===\n";
   {
     std::vector<int> out;
@@ -568,7 +569,7 @@ int main() {
   }
 
   // Demo 18: Emit<int> and Emit<std::string> are distinct effects.
-  //   annotate : Fx<void, Emit<int>, Emit<std::string>>
+  //   annotate : Row<Emit<int>, Emit<std::string>>::Fx<void>
   //   Each specialisation requires its own typed handler.
   std::cout << "=== Demo 18: Two Emit specialisations — distinct effects ===\n";
   {
@@ -602,7 +603,7 @@ int main() {
   }
 
   // Demo 20: Composite handler mixed with a plain TypedHandler.
-  //   compute_ratio : Fx<string, Ask, Log, Fail>
+  //   compute_ratio : All::Fx<string>
   //   ScriptedIO (IO::Handler<ScriptedIO>) covers Ask+Log.
   //   WarnFail (Fail::Handler<WarnFail>) covers Fail.
   //   Two handler arguments — one composite, one single — satisfy all three.
@@ -613,7 +614,7 @@ int main() {
   }
 
   // Demo 21: AllHandler covers Ask + Log + Fail in one struct.
-  //   compute_ratio : Fx<string, Ask, Log, Fail>
+  //   compute_ratio : All::Fx<string>
   //   AllHandler{} satisfies all three with a single .run() argument.
   //   Divide by zero fires Fail inside AllHandler.
   std::cout << "=== Demo 21: AllHandler covers all three effects ===\n";

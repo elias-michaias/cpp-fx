@@ -5,22 +5,23 @@
 //
 // --- API -------------------------------------------------------------------
 //
-//  Effect<T> -- CRTP base; gives E::Fx<R>. Use: struct MyEff : Effect<MyEff> {} struct with  `using result_type = T;`
-//  Handler H -- callable  (E, std::function<void(E::result_type)>) -> void
-//               plus a   `using effect_type = E;`  alias for deduction
+//  Effect<Self>     -- CRTP base; gives Self::Fx<R> and Self::Handler<Derived>
+//                      Use: struct MyEff : Effect<MyEff> { using result_type = T; };
+//  Handler H        -- callable  (E, std::function<void(E::result_type)>) -> void
 //
-//  Fx<T, E1, E2, ...>       -- coroutine return type; declares performed
-//  effects perform(e)               -- co_await inside an Fx<T, ...>
-//  handle<E>(comp, h)       -- install h for E; returns Fx<T, remaining...>
-//                              compile error if E is not in comp's declared
-//                              effects
+//  E::Fx<T>                 -- coroutine return type for a single effect E
+//  Row<E1,E2>::Fx<T>        -- coroutine return type for multiple effects
+//  Fx<T>                    -- pure computation, no effects (zero-arg .run())
+//  perform(e)               -- co_await an effect inside an Fx
+//  handle<E>(comp, h)       -- install h for E; returns Fx with E removed
+//                              compile error if E is not in comp's declared effects
 //  comp.run(h1, h2, ...)    -- validate ALL declared effects are handled, run
-//                              compile error if any declared effect lacks a
-//                              handler
+//                              compile error if any declared effect lacks a handler
 //  run_with(comp, h1, h2..) -- same as .run(), kept for backward compatibility
-//  handler<E>(lambda)       -- wrap a plain lambda as a TypedHandler
-//  Computation<T>           -- alias for Fx<T> (zero declared effects,
-//  back-compat)
+//  handler<E>(lambda)       -- wrap a lambda as a single-effect TypedHandler
+//  handler<Row>(l1, l2, ...) -- build an inline CompositeHandler for a Row
+//  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is complete
+//  Computation<T>           -- alias for Fx<T> (back-compat)
 
 #include <coroutine>
 #include <exception>
@@ -283,7 +284,7 @@ public:
     }
 
     // Invalid: effect not declared — deleted so IDEs squiggle at the perform()
-    // call. To fix: add the effect to the return type: Fx<T, ..., EffectType>.
+    // call. To fix: add EffectType to the return type: E::Fx<T> or Row<..., E>::Fx<T>.
     template <Effectful Eff>
     PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
 
