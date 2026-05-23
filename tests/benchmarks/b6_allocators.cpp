@@ -21,7 +21,6 @@
 #include <cstddef>
 #include <iostream>
 #include <memory_resource>
-#include <new>
 #include <vector>
 
 // ── Effect under test ────────────────────────────────────────────────────────
@@ -99,7 +98,8 @@ private:
     return b->data;
   }
 
-  void do_deallocate(void *ptr, std::size_t n, std::size_t align) noexcept override {
+  void do_deallocate(void *ptr, std::size_t n,
+                     std::size_t align) noexcept override {
     if (!in_slab(ptr)) {
       fallback_->deallocate(ptr, n, align); // came from fallback
       return;
@@ -116,8 +116,8 @@ private:
 
 // ── Benchmark parameters ─────────────────────────────────────────────────────
 
-static constexpr int BATCH = 5'000;   // performs per coroutine
-static constexpr int REPS  = 2'000;   // coroutine invocations
+static constexpr int BATCH = 5'000; // performs per coroutine
+static constexpr int REPS = 2'000;  // coroutine invocations
 
 // Arena must hold BATCH payloads + one frame per invocation.
 // We round up generously and keep a single large buffer.
@@ -147,10 +147,10 @@ static auto make_batch_coro() -> Tick::Fx<long long> {
 int main() {
   section("b6 — Allocator strategies");
   std::cout << "  Payload<Tick> size : " << kPayloadSize << " bytes\n";
-  std::cout << "  Block size (slab)  : " << kBlockSize  << " bytes\n";
-  std::cout << "  Arena budget       : " << kArena/1024 << " KiB\n";
-  std::cout << "  Batch              : " << BATCH << " performs × "
-                                         << REPS  << " coroutines\n";
+  std::cout << "  Block size (slab)  : " << kBlockSize << " bytes\n";
+  std::cout << "  Arena budget       : " << kArena / 1024 << " KiB\n";
+  std::cout << "  Batch              : " << BATCH << " performs × " << REPS
+            << " coroutines\n";
 
   section("Batch cost (per-coroutine ns)");
 
@@ -229,9 +229,7 @@ int main() {
 
   static constexpr int SP_REPS = 500'000;
 
-  auto sp_make = []() -> Tick::Fx<int> {
-    co_return perform(Tick{});
-  };
+  auto sp_make = []() -> Tick::Fx<int> { co_return perform(Tick{}); };
 
   // 1s. Default
   print_result(bench("1s. Default", SP_REPS, [&] {
@@ -243,8 +241,8 @@ int main() {
   // 4s. PMR pool (steady-state)
   {
     std::vector<std::byte> pbuf2(65536);
-    std::pmr::monotonic_buffer_resource b2{
-        pbuf2.data(), pbuf2.size(), std::pmr::null_memory_resource()};
+    std::pmr::monotonic_buffer_resource b2{pbuf2.data(), pbuf2.size(),
+                                           std::pmr::null_memory_resource()};
     std::pmr::unsynchronized_pool_resource pool2{&b2};
     fx::ScopedAllocator a2{&pool2};
     print_result(bench("4s. PMR pool", SP_REPS, [&] {

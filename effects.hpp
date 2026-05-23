@@ -111,9 +111,14 @@ inline thread_local std::pmr::memory_resource *current_mr = nullptr;
 
 template <Effectful E> inline constexpr char effect_tag_v = 0;
 
+/// Per-perform payload passed from PerformAwaitable to the handler dispatch.
+/// Stores the effect value, the suspended coroutine's handle (type-erased),
+/// and a direct pointer into the awaitable's result slot — no heap allocation
+/// for the resume callable.
 template <Effectful E> struct Payload {
   E effect_value;
-  std::function<void(typename E::result_type)> resume;
+  std::coroutine_handle<> caller;
+  typename E::result_type *result_ptr;
 };
 
 /// Allocate one T using current_mr (or global new if none is installed).
@@ -413,10 +418,12 @@ struct ScopedHandler {
       using R = typename E::result_type;
       auto &hh = *reinterpret_cast<std::remove_reference_t<H> *>(hobj);
       auto *pl = reinterpret_cast<detail::Payload<E> *>(raw);
+      // lambda captures one pointer — fits in std::function SBO, no heap alloc
       std::function<void(R)> resume = [pl](R v) {
-        auto fn = std::move(pl->resume);
+        *pl->result_ptr = std::move(v);
+        auto caller = pl->caller;
         detail::pmr_delete(pl);
-        fn(std::move(v));
+        caller.resume();
       };
       hh(pl->effect_value, std::move(resume));
     };
@@ -713,14 +720,10 @@ public:
 
   template <typename Promise>
   void await_suspend(std::coroutine_handle<Promise> caller) {
-    using R = typename E::result_type;
-
     auto *payload = detail::pmr_new(
         detail::Payload<E>{.effect_value = std::move(effect_),
-                           .resume = [this, caller](R v) mutable {
-                             result_ = std::move(v);
-                             caller.resume();
-                           }});
+                           .caller = caller,
+                           .result_ptr = &result_});
 
     caller.promise().effect_tag = &detail::effect_tag_v<E>;
     caller.promise().payload_ptr = payload;
