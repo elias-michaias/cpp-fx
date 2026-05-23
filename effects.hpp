@@ -5,7 +5,7 @@
 //
 // --- API -------------------------------------------------------------------
 //
-//  Effect E  -- struct with  `using result_type = T;`
+//  Effect<T> -- CRTP base; gives E::Fx<R>. Use: struct MyEff : Effect<MyEff> {} struct with  `using result_type = T;`
 //  Handler H -- callable  (E, std::function<void(E::result_type)>) -> void
 //               plus a   `using effect_type = E;`  alias for deduction
 //
@@ -36,11 +36,11 @@ namespace fx {
 // --- Concepts ---------------------------------------------------------------
 
 template <typename E>
-concept Effect = requires { typename E::result_type; };
+concept Effectful = requires { typename E::result_type; };
 
 template <typename H, typename E>
 concept HandlerFor =
-    Effect<E> &&
+    Effectful<E> &&
     std::is_invocable_v<H, E, std::function<void(typename E::result_type)>>;
 
 template <typename H>
@@ -51,7 +51,7 @@ concept TypedHandler =
 
 // --- handler<E>(lambda) wrapper ---------------------------------------------
 
-template <Effect E, typename F>
+template <Effectful E, typename F>
   requires HandlerFor<F, E>
 struct LambdaHandler {
   using effect_type = E;
@@ -61,7 +61,7 @@ struct LambdaHandler {
   }
 };
 
-template <Effect E, typename F>
+template <Effectful E, typename F>
   requires HandlerFor<F, E>
 auto handler(F &&fn) {
   return LambdaHandler<E, std::decay_t<F>>{std::forward<F>(fn)};
@@ -80,9 +80,9 @@ struct HandlerNode {
 
 inline thread_local HandlerNode *stack_top = nullptr;
 
-template <Effect E> inline constexpr char effect_tag_v = 0;
+template <Effectful E> inline constexpr char effect_tag_v = 0;
 
-template <Effect E> struct Payload {
+template <Effectful E> struct Payload {
   E effect_value;
   std::function<void(typename E::result_type)> resume;
 };
@@ -154,8 +154,8 @@ inline constexpr bool all_in_v<type_list<InnerEs...>, OuterEs...> =
 } // namespace detail
 
 // Forward-declare Fx and PerformAwaitable so promise_type can reference both.
-template <typename T, Effect... Es> class Fx;
-template <Effect E> class PerformAwaitable;
+template <typename T, Effectful... Es> class Fx;
+template <Effectful E> class PerformAwaitable;
 
 namespace detail {
 
@@ -179,13 +179,13 @@ template <typename F> struct FxAwaitable {
 
 } // namespace detail
 
-template <Effect E, typename T, Effect... Es>
+template <Effectful E, typename T, Effectful... Es>
 using remove_effect_t = detail::fx_from_list_t<
     T, typename detail::remove_from_list<E, detail::type_list<Es...>>::type>;
 
 // --- ScopedHandler ----------------------------------------------------------
 
-template <Effect E, typename H>
+template <Effectful E, typename H>
   requires HandlerFor<H, E>
 struct ScopedHandler {
   detail::HandlerNode node;
@@ -216,7 +216,7 @@ struct ScopedHandler {
 
 // --- Fx<T, Es...> -----------------------------------------------------------
 
-template <typename T, Effect... Es> class Fx {
+template <typename T, Effectful... Es> class Fx {
 public:
   struct promise_type {
     std::optional<T> result;
@@ -232,7 +232,7 @@ public:
     using declared_effects = detail::type_list<Es...>;
 
     // Valid: effect is declared in this Fx's return type.
-    template <Effect Eff>
+    template <Effectful Eff>
       requires detail::contains_in_list_v<Eff, detail::type_list<Es...>>
     PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept {
       return a;
@@ -240,13 +240,13 @@ public:
 
     // Invalid: effect not declared — deleted so IDEs squiggle at the perform()
     // call. To fix: add the effect to the return type: Fx<T, ..., EffectType>.
-    template <Effect Eff>
+    template <Effectful Eff>
     PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
 
     // co_await inner_fx: run an inner effectful computation, propagating its
     // effects. All of the inner Fx's effects must appear in this function's
     // return type.
-    template <typename T2, Effect... InnerEs>
+    template <typename T2, Effectful... InnerEs>
       requires detail::all_in_v<detail::type_list<InnerEs...>, Es...>
     detail::FxAwaitable<Fx<T2, InnerEs...>>
     await_transform(Fx<T2, InnerEs...> inner) noexcept {
@@ -256,7 +256,7 @@ public:
     // Missing propagation: inner Fx has an effect not declared here — IDE
     // squiggle. To fix: add the missing effect(s) to this function's return
     // type.
-    template <typename T2, Effect... InnerEs>
+    template <typename T2, Effectful... InnerEs>
       requires(!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
     detail::FxAwaitable<Fx<T2, InnerEs...>>
         await_transform(Fx<T2, InnerEs...>) = delete;
@@ -337,14 +337,14 @@ public:
   }
 };
 
-template <typename T, Effect... Es>
+template <typename T, Effectful... Es>
 Fx<T, Es...> Fx<T, Es...>::promise_type::get_return_object() noexcept {
   return Fx{Handle::from_promise(*this)};
 }
 
 // --- Fx<void, Es...> --------------------------------------------------------
 
-template <Effect... Es> class Fx<void, Es...> {
+template <Effectful... Es> class Fx<void, Es...> {
 public:
   struct promise_type {
     std::exception_ptr exception;
@@ -358,23 +358,23 @@ public:
     void unhandled_exception() { exception = std::current_exception(); }
     using declared_effects = detail::type_list<Es...>;
 
-    template <Effect Eff>
+    template <Effectful Eff>
       requires detail::contains_in_list_v<Eff, detail::type_list<Es...>>
     PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept {
       return a;
     }
 
-    template <Effect Eff>
+    template <Effectful Eff>
     PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
 
-    template <typename T2, Effect... InnerEs>
+    template <typename T2, Effectful... InnerEs>
       requires detail::all_in_v<detail::type_list<InnerEs...>, Es...>
     detail::FxAwaitable<Fx<T2, InnerEs...>>
     await_transform(Fx<T2, InnerEs...> inner) noexcept {
       return {std::move(inner)};
     }
 
-    template <typename T2, Effect... InnerEs>
+    template <typename T2, Effectful... InnerEs>
       requires(!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
     detail::FxAwaitable<Fx<T2, InnerEs...>>
         await_transform(Fx<T2, InnerEs...>) = delete;
@@ -449,7 +449,7 @@ public:
   }
 };
 
-template <Effect... Es>
+template <Effectful... Es>
 Fx<void, Es...> Fx<void, Es...>::promise_type::get_return_object() noexcept {
   return Fx{Handle::from_promise(*this)};
 }
@@ -468,7 +468,7 @@ concept AnyFx = requires {
 
 namespace detail {
 // Given Fx<T, E1, E2, E3> and E to remove → Fx<T, E1, E3>.
-template <Effect E, AnyFx F>
+template <Effectful E, AnyFx F>
 using remove_effect_from_fx_t =
     fx_from_list_t<typename F::value_type,
                    typename remove_from_list<E, typename F::effect_list>::type>;
@@ -476,7 +476,7 @@ using remove_effect_from_fx_t =
 
 // --- perform(e) -------------------------------------------------------------
 
-template <Effect E> class [[nodiscard]] PerformAwaitable {
+template <Effectful E> class [[nodiscard]] PerformAwaitable {
 public:
   explicit PerformAwaitable(E e) : effect_(std::move(e)) {}
 
@@ -514,7 +514,7 @@ private:
 };
 
 namespace detail {
-template <Effect E> auto perform_impl(E e) {
+template <Effectful E> auto perform_impl(E e) {
   return PerformAwaitable<E>{std::move(e)};
 }
 } // namespace detail
@@ -525,7 +525,7 @@ template <Effect E> auto perform_impl(E e) {
 // Compile error if E is not declared in the source Fx type.
 // The returned Fx is lazy: h is not invoked until .run() is called.
 
-template <Effect E, AnyFx F, typename H>
+template <Effectful E, AnyFx F, typename H>
   requires HandlerFor<H, E> &&
            detail::contains_in_list_v<E, typename F::effect_list>
 auto handle(F comp, H h) -> detail::remove_effect_from_fx_t<E, F> {
@@ -541,27 +541,31 @@ auto handle(F comp, H h) -> detail::remove_effect_from_fx_t<E, F> {
 
 // --- run_with -- backward-compatible free-function wrapper around .run() ----
 
-template <typename T, Effect... Es, TypedHandler... Hs>
+template <typename T, Effectful... Es, TypedHandler... Hs>
 T run_with(Fx<T, Es...> comp, Hs &&...hs) {
   return comp.run(std::forward<Hs>(hs)...);
 }
 
-template <Effect... Es, TypedHandler... Hs>
+template <Effectful... Es, TypedHandler... Hs>
 void run_with(Fx<void, Es...> comp, Hs &&...hs) {
   comp.run(std::forward<Hs>(hs)...);
 }
 
-template <Effect... Es> struct Row {
+template <Effectful... Es> struct Row {
   template <typename T> using Fx = ::fx::Fx<T, Es...>;
 };
 
 template <typename R1, typename R2> struct combine_rows_t;
-template <Effect... A, Effect... B>
+template <Effectful... A, Effectful... B>
 struct combine_rows_t<Row<A...>, Row<B...>> {
   using type = Row<A..., B...>;
 };
 template <typename R1, typename R2>
 using Combine = typename combine_rows_t<R1, R2>::type;
+
+template <typename Self> struct Effect {
+  template <typename T> using Fx = ::fx::Fx<T, Self>;
+};
 
 } // namespace fx
 

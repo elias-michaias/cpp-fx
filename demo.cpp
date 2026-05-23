@@ -10,21 +10,29 @@ using namespace fx;
 // --- 1. Effect declarations -------------------------------------------------
 
 // Ask for user input; handler resumes with a std::string.
-struct Ask {
+struct Ask : Effect<Ask> {
   using result_type = std::string;
   std::string prompt;
 };
 
 // Fire-and-forget log line; handler resumes with monostate.
-struct Log {
+struct Log : Effect<Log> {
   using result_type = std::monostate;
   std::string message;
 };
 
 // Signal an error; handler may resume with a fallback int.
-struct Fail {
+struct Fail : Effect<Fail> {
   using result_type = int;
   std::string reason;
+};
+
+// Generic / parameterised effect.  Emit<int> and Emit<std::string> are
+// *separate* effects: each needs its own handler.
+// CRTP base gives Emit<T>::Fx<R> for free.
+template <typename T> struct Emit : Effect<Emit<T>> {
+  T value;
+  using result_type = std::monostate;
 };
 
 using IO = Row<Ask, Log>;
@@ -36,25 +44,66 @@ using All = Combine<IO, Row<Fail>>;
 // The declared effects are visible at every call site.
 
 let greet() -> IO::Fx<std::string> {
-  perform(Log{"Starting greet"});
-  let name = perform(Ask{"Your name: "});
-  perform(Log{"Got: " + name});
+  perform(Log{.message = "Starting greet"});
+  let name = perform(Ask{.prompt = "Your name: "});
+  perform(Log{.message = "Got: " + name});
   co_return "Hello, " + name + "!";
 }
 
-let safe_div(int a, int b) -> Fx<int, Fail> {
+let safe_div(int a, int b) -> Fail::Fx<int> {
   if (b == 0) {
-    co_return perform(Fail{"division by zero"});
+    co_return perform(Fail{.reason = "division by zero"});
   } else {
     co_return a / b;
   }
 }
 
-let collect(int n) -> Fx<std::vector<std::string>, Ask> {
+let collect(int n) -> Ask::Fx<std::vector<std::string>> {
   std::vector<std::string> out;
   for (int i = 0; i < n; ++i)
-    out.push_back(perform(Ask{"Name " + std::to_string(i + 1) + ": "}));
+    out.push_back(
+        perform(Ask{.prompt = "Name " + std::to_string(i + 1) + ": "}));
   co_return out;
+}
+
+// --- Generic-effect functions -----------------------------------------------
+//
+// Emit<int>::Fx<void>  is identical to  Fx<void, Emit<int>>.
+// The :: notation is just syntactic sugar from the CRTP base.
+
+// Leaf: emits every integer in [lo, hi).
+let range(int lo, int hi) -> Emit<int>::Fx<void> {
+  for (int i = lo; i < hi; ++i)
+    perform(Emit<int>{.value = i});
+}
+
+// Propagation: calls range (Emit<int> propagates up) and adds its own Log.
+let range_logged(int lo, int hi) -> Fx<void, Emit<int>, Log> {
+  perform(Log{.message = "emitting [" + std::to_string(lo) + ", " +
+                         std::to_string(hi) + ")"});
+  co_await range(lo, hi);
+  perform(Log{.message = "done"});
+}
+
+// Local absorption: Emit<int> is handled inside the body.
+// Caller sees a pure Fx<int> — .run() needs no handlers.
+let sum_range(int lo, int hi) -> Fx<int> {
+  int total = 0;
+  co_await handle<Emit<int>>(range(lo, hi),
+                             handler<Emit<int>>([&total](Emit<int> e, auto r) {
+                               total += e.value;
+                               r({});
+                             }));
+  co_return total;
+}
+
+// Two distinct specialisations: Emit<int> and Emit<std::string> are
+// completely separate effects and require separate handlers.
+let annotate(int lo, int hi) -> Fx<void, Emit<int>, Emit<std::string>> {
+  for (int i = lo; i < hi; ++i) {
+    perform(Emit<int>{.value = i * i});
+    perform(Emit<std::string>{.value = std::to_string(i) + "\xc2\xb2"});
+  }
 }
 
 // --- 3. Reusable handler structs --------------------------------------------
@@ -97,30 +146,30 @@ struct WarnFail {
 //   compute_ratio     : Fx<string, Ask, Log, Fail> -- calls both of the above
 
 // Leaf: just wraps a single Ask.
-let ask_once(std::string prompt) -> Fx<std::string, Ask> {
-  co_return perform(Ask{std::move(prompt)});
+let ask_once(std::string prompt) -> Ask::Fx<std::string> {
+  co_return perform(Ask{.prompt = std::move(prompt)});
 }
 
 // Calls ask_once (Ask propagated) and adds its own Log.
-let ask_and_log(std::string label, std::string prompt)
-    -> Fx<std::string, Ask, Log> {
-  perform(Log{"asking for " + label});
+let ask_and_log(std::string label, std::string prompt) -> IO::Fx<std::string> {
+  perform(Log{.message = "asking for " + label});
   let answer = co_await ask_once(std::move(prompt));
-  perform(Log{"got " + label + ": " + answer});
+  perform(Log{.message = "got " + label + ": " + answer});
   co_return answer;
 }
 
 // Calls safe_div (Fail propagated) and wraps it in Log.
-let safe_div_logged(int a, int b) -> Fx<int, Log, Fail> {
-  perform(Log{"computing " + std::to_string(a) + "/" + std::to_string(b)});
+let safe_div_logged(int a, int b) -> Row<Log, Fail>::Fx<int> {
+  perform(Log{.message =
+                  "computing " + std::to_string(a) + "/" + std::to_string(b)});
   let result = co_await safe_div(a, b);
-  perform(Log{"result: " + std::to_string(result)});
+  perform(Log{.message = "result: " + std::to_string(result)});
   co_return result;
 }
 
 // Three-level chain: calls ask_and_log (Ask+Log) and safe_div_logged
 // (Log+Fail). Own effect list is the union: Ask + Log + Fail.
-let compute_ratio() -> Fx<std::string, Ask, Log, Fail> {
+let compute_ratio() -> All::Fx<std::string> {
   let num = co_await ask_and_log("numerator", "Numerator:   ");
   let den = co_await ask_and_log("denominator", "Denominator: ");
   let ratio = co_await safe_div_logged(std::stoi(num), std::stoi(den));
@@ -140,7 +189,7 @@ let compute_ratio() -> Fx<std::string, Ask, Log, Fail> {
 // ask_and_log : Fx<string, Ask, Log>
 // return type : Fx<string, Ask>        ← Log gone
 let ask_silently(std::string label, std::string prompt)
-    -> Fx<std::string, Ask> {
+    -> Ask::Fx<std::string> {
   return handle<Log>(ask_and_log(std::move(label), std::move(prompt)),
                      handler<Log>([](Log, auto r) { r({}); }));
 }
@@ -148,7 +197,7 @@ let ask_silently(std::string label, std::string prompt)
 // Pattern 1b: recover from failure — handle<Fail> strips Fail, returns 0.
 // safe_div_logged : Fx<int, Log, Fail>
 // return type     : Fx<int, Log>       ← Fail gone, Log propagates
-let safe_div_or_zero(int a, int b) -> Fx<int, Log> {
+let safe_div_or_zero(int a, int b) -> Log::Fx<int> {
   return handle<Fail>(safe_div_logged(a, b),
                       handler<Fail>([](Fail, auto r) { r(0); }));
 }
@@ -174,7 +223,7 @@ let silent_safe_div(int a, int b) -> Fx<int> {
 //   Ask  — new (prompts for operands)
 //   Log  — propagated from safe_div_logged
 //   Fail — absorbed (never reaches caller)
-let prompted_safe_div() -> Fx<int, Ask, Log> {
+let prompted_safe_div() -> IO::Fx<int> {
   let num = std::stoi(co_await ask_once("Numerator:   "));
   let den = std::stoi(co_await ask_once("Denominator: "));
   co_return co_await handle<Fail>(safe_div_logged(num, den),
@@ -427,6 +476,74 @@ int main() {
     std::cout << "8/4 = " << run({"8", "4"}) << "\n";
     std::cout << "8/0 = " << run({"8", "0"})
               << " (Fail absorbed, fallback 0)\n\n";
+  }
+
+  // Demo 15: Generic effect Emit<T>.
+  //   range(1,6)        : Emit<int>::Fx<void>  (== Fx<void, Emit<int>>)
+  //   handler collects emitted values into a vector.
+  std::cout << "=== Demo 15: Generic effect Emit<T> ===\n";
+  {
+    std::vector<int> out;
+    range(1, 6).run(handler<Emit<int>>([&](Emit<int> e, auto r) {
+      out.push_back(e.value);
+      r({});
+    }));
+    std::cout << "collected:";
+    for (int v : out)
+      std::cout << " " << v;
+    std::cout << "\n\n";
+  }
+
+  // Demo 16: Emit<int> propagates through range_logged alongside Log.
+  //   range_logged : Fx<void, Emit<int>, Log> — both effects reach the caller.
+  std::cout << "=== Demo 16: Emit<int> propagates (alongside Log) ===\n";
+  {
+    std::vector<int> out;
+    range_logged(1, 5).run(handler<Emit<int>>([&](Emit<int> e, auto r) {
+                             out.push_back(e.value);
+                             r({});
+                           }),
+                           handler<Log>([](Log e, auto r) {
+                             std::cout << "[log] " << e.message << "\n";
+                             r({});
+                           }));
+    std::cout << "emitted:";
+    for (int v : out)
+      std::cout << " " << v;
+    std::cout << "\n\n";
+  }
+
+  // Demo 17: Emit<int> absorbed locally — caller sees a pure Fx<int>.
+  //   sum_range : Fx<int>  — no effects, .run() needs no handlers.
+  std::cout << "=== Demo 17: Absorb Emit<int> locally — pure Fx<int> ===\n";
+  {
+    std::cout << "sum [1,6)  = " << sum_range(1, 6).run() << "\n";
+    std::cout << "sum [1,11) = " << sum_range(1, 11).run() << "\n\n";
+  }
+
+  // Demo 18: Emit<int> and Emit<std::string> are distinct effects.
+  //   annotate : Fx<void, Emit<int>, Emit<std::string>>
+  //   Each specialisation requires its own typed handler.
+  std::cout << "=== Demo 18: Two Emit specialisations — distinct effects ===\n";
+  {
+    std::vector<int> nums;
+    std::vector<std::string> labels;
+    annotate(1, 5).run(
+        handler<Emit<int>>([&](Emit<int> e, auto r) {
+          nums.push_back(e.value);
+          r({});
+        }),
+        handler<Emit<std::string>>([&](Emit<std::string> e, auto r) {
+          labels.push_back(e.value);
+          r({});
+        }));
+    std::cout << "squares:";
+    for (int v : nums)
+      std::cout << " " << v;
+    std::cout << "\nlabels:";
+    for (auto &s : labels)
+      std::cout << " " << s;
+    std::cout << "\n\n";
   }
 
   return 0;
