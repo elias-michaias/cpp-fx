@@ -25,7 +25,7 @@ auto greet() -> IO::Fx<std::string> {
 }
 
 int main() {
-  auto h = handler<IO>(        // <-- error: Log lambda is missing
+  auto h = handler<IO>( // <-- error: Log lambda is missing
       [](Ask, auto r) { r(std::string{"x"}); }
       // missing: [](Log, auto r) { r({}); }
   );

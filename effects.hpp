@@ -47,14 +47,14 @@ namespace fx {
 template <typename E>
 concept Effectful = requires { typename E::result_type; };
 
-/// Satisfied when H can be called as `h(E{...}, resume)` where
-/// `resume` is a `std::function<void(E::result_type)>`.
-/// Both struct handlers and lambdas satisfy this as long as their
-/// call signature matches.
+/// Satisfied when H can be called as `h(e, resume)` where `e` is of type
+/// `E` and `resume` is `std::function<void(E::result_type)>`.
+/// The `requires` expression shows the expected call shape in diagnostics.
 template <typename H, typename E>
 concept HandlerFor =
     Effectful<E> &&
-    std::is_invocable_v<H, E, std::function<void(typename E::result_type)>>;
+    requires(std::remove_cvref_t<H> &h, E e,
+             std::function<void(typename E::result_type)> r) { h(e, r); };
 
 /// Satisfied by handler objects that advertise their target effect via
 /// an `effect_type` alias (produced by `Effect::Handler<Derived>` or
@@ -155,26 +155,24 @@ struct remove_from_list<T, type_list<Head, Tail...>> {
                                   typename prepend_list<Head, rest>::type>;
 };
 
-// single_covers_v / composite_covers_v: SFINAE-safe per-handler coverage
-// checks.
-template <typename E, typename H> inline constexpr bool single_covers_v = false;
+// Coverage concepts — used inside effect_is_handled_v.
+// Being named concepts means GCC/Clang print the concept name in constraint
+// failure notes, making "which handler covered which effect" self-evident.
 template <typename E, typename H>
-  requires requires { typename H::effect_type; }
-inline constexpr bool single_covers_v<E, H> =
+concept SingleCoversEffect =
+    requires { typename H::effect_type; } &&
     std::is_same_v<E, typename H::effect_type>;
 
 template <typename E, typename H>
-inline constexpr bool composite_covers_v = false;
-template <typename E, typename H>
-  requires requires { typename H::effect_types; }
-inline constexpr bool composite_covers_v<E, H> =
+concept CompositeCoversEffect =
+    requires { typename H::effect_types; } &&
     contains_in_list_v<E, typename H::effect_types>;
 
 // True if at least one handler in Hs... covers effect E.
 template <typename E, typename... Hs>
 inline constexpr bool effect_is_handled_v =
-    (... || (single_covers_v<E, std::remove_cvref_t<Hs>> ||
-             composite_covers_v<E, std::remove_cvref_t<Hs>>));
+    (... || (SingleCoversEffect<E, std::remove_cvref_t<Hs>> ||
+             CompositeCoversEffect<E, std::remove_cvref_t<Hs>>));
 
 // True if every effect in the list has a matching handler.
 template <typename EffectList, typename... Hs>
@@ -279,11 +277,6 @@ template <typename F> struct FxAwaitable {
   void await_suspend(auto) noexcept {} // never reached
   decltype(auto) await_resume() { return inner._run(); }
 };
-
-// always_false_v: dependent false for static_assert in constrained templates.
-// Must depend on a template parameter so the assert only fires at
-// instantiation.
-template <typename...> inline constexpr bool always_false_v = false;
 
 // Shared promise_type base for Fx<T> and Fx<void>.
 // Holds the coroutine state and all await_transform overloads in one place.
@@ -606,6 +599,14 @@ concept AnyFx = requires {
   typename F::effect_list;
 };
 
+/// Satisfied when effect `E` is listed in `F`'s declared effect set.
+/// Used to constrain `handle<E>()` — when violated, the concept name itself
+/// describes the problem: "E is not declared in this computation's type."
+template <typename E, typename F>
+concept DeclaredIn =
+    Effectful<E> && AnyFx<F> &&
+    detail::contains_in_list_v<E, typename F::effect_list>;
+
 namespace detail {
 // Given Fx<T, E1, E2, E3> and E to remove → Fx<T, E1, E3>.
 template <Effectful E, AnyFx F>
@@ -669,15 +670,15 @@ template <Effectful E> auto perform_impl(E e) {
 /// `E` removed from the effect list.  The returned computation is lazy —
 /// `h` is not invoked until `.run()` (or another `handle`) is called.
 ///
-/// Compile error if `E` is not declared in `comp`'s effect list.
+/// Compile error (`DeclaredIn` constraint) if `E` is not declared in
+/// `comp`'s effect list.
 ///
 ///   // Fail::Fx<int>  →  Fx<int>  (no remaining effects)
 ///   auto result = handle<Fail>(safe_div(10, 0),
 ///                   handler<Fail>([](Fail, auto r) { r(-1); }))
 ///                 .run();
 template <Effectful E, AnyFx F, typename H>
-  requires HandlerFor<H, E> &&
-           detail::contains_in_list_v<E, typename F::effect_list>
+  requires HandlerFor<H, E> && DeclaredIn<E, F>
 auto handle(F comp, H h) -> detail::remove_effect_from_fx_t<E, F> {
   using RetFx = detail::remove_effect_from_fx_t<E, F>;
   using Hb = std::remove_cvref_t<H>;
