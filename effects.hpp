@@ -21,7 +21,7 @@
 //  comp.run(h1, h2, ...)    -- validate ALL declared effects are handled, run
 //                              compile error if any declared effect lacks a
 //                              handler
-//  run_with(comp, h1, h2..) -- same as .run(), kept for backward compatibility
+
 //  handler<E>(lambda)       -- wrap a lambda as a single-effect TypedHandler
 //  handler<Row>(l1, l2, ...) -- build an inline CompositeHandler for a Row
 //  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is
@@ -769,20 +769,6 @@ auto handle(F comp, H h) -> detail::remove_effect_from_fx_t<E, F> {
         ScopedHandler<E, Hb> guard{local_h};
         return comp._run();
       }}};
-}
-
-// --- run_with — backward-compatible free-function wrapper around .run() -----
-
-/// Equivalent to `comp.run(hs...)`.  Kept for backward compatibility;
-/// prefer the `.run()` member directly for new code.
-template <typename T, Effectful... Es, typename... Hs>
-T run_with(Fx<T, Es...> comp, Hs &&...hs) {
-  return comp.run(std::forward<Hs>(hs)...);
-}
-
-template <Effectful... Es, typename... Hs>
-void run_with(Fx<void, Es...> comp, Hs &&...hs) {
-  comp.run(std::forward<Hs>(hs)...);
 }
 
 /// Groups several effects (or other rows) into a named row.
