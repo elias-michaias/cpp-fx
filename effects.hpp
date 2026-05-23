@@ -112,7 +112,8 @@ inline constexpr bool contains_v = (std::is_same_v<T, Ts> || ...);
 template <typename T, typename List>
 inline constexpr bool contains_in_list_v = false;
 template <typename T, typename... Ts>
-inline constexpr bool contains_in_list_v<T, type_list<Ts...>> = contains_v<T, Ts...>;
+inline constexpr bool contains_in_list_v<T, type_list<Ts...>> =
+    contains_v<T, Ts...>;
 
 template <typename T, typename List> struct prepend_list;
 template <typename T, typename... Ts> struct prepend_list<T, type_list<Ts...>> {
@@ -142,7 +143,8 @@ template <typename... Es, typename... Hs>
 inline constexpr bool all_handled_v<type_list<Es...>, Hs...> =
     (... && effect_is_handled_v<Es, Hs...>);
 
-// True if every effect in InnerList appears in OuterEs... (for propagation checks).
+// True if every effect in InnerList appears in OuterEs... (for propagation
+// checks).
 template <typename InnerList, typename... OuterEs>
 inline constexpr bool all_in_v = false;
 template <typename... InnerEs, typename... OuterEs>
@@ -168,8 +170,7 @@ using fx_from_list_t = typename fx_from_list<T, List>::type;
 // await_ready() returns true so the outer coroutine never actually suspends:
 // the inner computation runs inside await_resume() using the already-installed
 // handler stack from the outer .run() call.
-template <typename F>
-struct FxAwaitable {
+template <typename F> struct FxAwaitable {
   F inner;
   bool await_ready() noexcept { return true; }
   void await_suspend(auto) noexcept {} // never reached
@@ -233,25 +234,32 @@ public:
     // Valid: effect is declared in this Fx's return type.
     template <Effect Eff>
       requires detail::contains_in_list_v<Eff, detail::type_list<Es...>>
-    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept { return a; }
+    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept {
+      return a;
+    }
 
-    // Invalid: effect not declared — deleted so IDEs squiggle at the perform() call.
-    // To fix: add the effect to the return type: Fx<T, ..., EffectType>.
+    // Invalid: effect not declared — deleted so IDEs squiggle at the perform()
+    // call. To fix: add the effect to the return type: Fx<T, ..., EffectType>.
     template <Effect Eff>
     PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
 
-    // co_await inner_fx: run an inner effectful computation, propagating its effects.
-    // All of the inner Fx's effects must appear in this function's return type.
+    // co_await inner_fx: run an inner effectful computation, propagating its
+    // effects. All of the inner Fx's effects must appear in this function's
+    // return type.
     template <typename T2, Effect... InnerEs>
       requires detail::all_in_v<detail::type_list<InnerEs...>, Es...>
     detail::FxAwaitable<Fx<T2, InnerEs...>>
-    await_transform(Fx<T2, InnerEs...> inner) noexcept { return {std::move(inner)}; }
+    await_transform(Fx<T2, InnerEs...> inner) noexcept {
+      return {std::move(inner)};
+    }
 
-    // Missing propagation: inner Fx has an effect not declared here — IDE squiggle.
-    // To fix: add the missing effect(s) to this function's return type.
+    // Missing propagation: inner Fx has an effect not declared here — IDE
+    // squiggle. To fix: add the missing effect(s) to this function's return
+    // type.
     template <typename T2, Effect... InnerEs>
-      requires (!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
-    detail::FxAwaitable<Fx<T2, InnerEs...>> await_transform(Fx<T2, InnerEs...>) = delete;
+      requires(!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
+    detail::FxAwaitable<Fx<T2, InnerEs...>>
+        await_transform(Fx<T2, InnerEs...>) = delete;
   };
   using Handle = std::coroutine_handle<promise_type>;
   using value_type = T;
@@ -352,7 +360,9 @@ public:
 
     template <Effect Eff>
       requires detail::contains_in_list_v<Eff, detail::type_list<Es...>>
-    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept { return a; }
+    PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff> a) noexcept {
+      return a;
+    }
 
     template <Effect Eff>
     PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
@@ -360,11 +370,14 @@ public:
     template <typename T2, Effect... InnerEs>
       requires detail::all_in_v<detail::type_list<InnerEs...>, Es...>
     detail::FxAwaitable<Fx<T2, InnerEs...>>
-    await_transform(Fx<T2, InnerEs...> inner) noexcept { return {std::move(inner)}; }
+    await_transform(Fx<T2, InnerEs...> inner) noexcept {
+      return {std::move(inner)};
+    }
 
     template <typename T2, Effect... InnerEs>
-      requires (!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
-    detail::FxAwaitable<Fx<T2, InnerEs...>> await_transform(Fx<T2, InnerEs...>) = delete;
+      requires(!detail::all_in_v<detail::type_list<InnerEs...>, Es...>)
+    detail::FxAwaitable<Fx<T2, InnerEs...>>
+        await_transform(Fx<T2, InnerEs...>) = delete;
   };
   using Handle = std::coroutine_handle<promise_type>;
   using value_type = void;
@@ -537,6 +550,18 @@ template <Effect... Es, TypedHandler... Hs>
 void run_with(Fx<void, Es...> comp, Hs &&...hs) {
   comp.run(std::forward<Hs>(hs)...);
 }
+
+template <Effect... Es> struct Row {
+  template <typename T> using Fx = ::fx::Fx<T, Es...>;
+};
+
+template <typename R1, typename R2> struct combine_rows_t;
+template <Effect... A, Effect... B>
+struct combine_rows_t<Row<A...>, Row<B...>> {
+  using type = Row<A..., B...>;
+};
+template <typename R1, typename R2>
+using Combine = typename combine_rows_t<R1, R2>::type;
 
 } // namespace fx
 

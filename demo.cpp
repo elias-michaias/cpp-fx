@@ -27,12 +27,15 @@ struct Fail {
   std::string reason;
 };
 
+using IO = Row<Ask, Log>;
+using All = Combine<IO, Row<Fail>>;
+
 // --- 2. Computations --------------------------------------------------------
 //
 // Return types are now Fx<ReturnType, Effects...>.
 // The declared effects are visible at every call site.
 
-let greet() -> Fx<std::string, Ask, Log> {
+let greet() -> IO::Fx<std::string> {
   perform(Log{"Starting greet"});
   let name = perform(Ask{"Your name: "});
   perform(Log{"Got: " + name});
