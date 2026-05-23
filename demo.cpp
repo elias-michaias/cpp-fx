@@ -106,18 +106,63 @@ let annotate(int lo, int hi) -> Fx<void, Emit<int>, Emit<std::string>> {
   }
 }
 
+// --- Composite handler examples ---------------------------------------------
+
+struct IOHandler : IO::Handler<IOHandler> {
+  std::string fixed_answer;
+  void operator()(Ask e, auto resume) {
+    std::cout << e.prompt << fixed_answer << "\n";
+    resume(fixed_answer);
+  }
+  void operator()(Log e, auto resume) {
+    std::cout << "[io] " << e.message << "\n";
+    resume({});
+  }
+};
+VALIDATE_HANDLER(IOHandler);
+
+struct AllHandler : All::Handler<AllHandler> {
+  std::string answer;
+  void operator()(Ask e, auto resume) {
+    std::cout << e.prompt << answer << "\n";
+    resume(answer);
+  }
+  void operator()(Log e, auto resume) {
+    std::cout << "[all] " << e.message << "\n";
+    resume({});
+  }
+  void operator()(Fail e, auto resume) {
+    std::cout << "[all] FAIL: " << e.reason << " -> -1\n";
+    resume(-1);
+  }
+};
+VALIDATE_HANDLER(AllHandler);
+
+struct ScriptedIO : IO::Handler<ScriptedIO> {
+  std::vector<std::string> answers;
+  int idx = 0;
+  void operator()(Ask e, std::function<void(std::string)> r) {
+    std::cout << e.prompt << answers[idx] << "\n";
+    r(answers[idx++]);
+  }
+  void operator()(Log e, std::function<void(std::monostate)> r) {
+    std::cout << "[io] " << e.message << "\n";
+    r({});
+  }
+};
+VALIDATE_HANDLER(ScriptedIO);
+
 // --- 3. Reusable handler structs --------------------------------------------
 
-struct StdoutLog {
-  using effect_type = Log;
+struct StdoutLog : Log::Handler<StdoutLog> {
   void operator()(Log e, auto resume) {
     std::cout << "[log] " << e.message << "\n";
     resume({});
   }
 };
+VALIDATE_HANDLER(StdoutLog);
 
-struct StdinAsk {
-  using effect_type = Ask;
+struct StdinAsk : Ask::Handler<StdinAsk> {
   void operator()(Ask e, auto resume) {
     std::cout << e.prompt;
     std::string line;
@@ -125,14 +170,15 @@ struct StdinAsk {
     resume(line);
   }
 };
+VALIDATE_HANDLER(StdinAsk);
 
-struct WarnFail {
-  using effect_type = Fail;
+struct WarnFail : Fail::Handler<WarnFail> {
   void operator()(Fail e, auto resume) {
     std::cout << "[warn] " << e.reason << " -> -1\n";
     resume(-1);
   }
 };
+VALIDATE_HANDLER(WarnFail);
 
 // --- 5. Composition examples ------------------------------------------------
 //
@@ -545,6 +591,99 @@ int main() {
       std::cout << " " << s;
     std::cout << "\n\n";
   }
+
+  // Demo 19: Single composite handler covers an entire Row.
+  //   IOHandler : IO::Handler<IOHandler>  — handles Ask + Log together.
+  //   greet()   : IO::Fx<string>          — needs Ask and Log.
+  //   .run(IOHandler{...}) satisfies both effects with one argument.
+  std::cout << "=== Demo 19: Composite handler for IO row ===\n";
+  {
+    std::cout << greet().run(IOHandler{.fixed_answer = "Alice"}) << "\n\n";
+  }
+
+  // Demo 20: Composite handler mixed with a plain TypedHandler.
+  //   compute_ratio : Fx<string, Ask, Log, Fail>
+  //   ScriptedIO (IO::Handler<ScriptedIO>) covers Ask+Log.
+  //   WarnFail (Fail::Handler<WarnFail>) covers Fail.
+  //   Two handler arguments — one composite, one single — satisfy all three.
+  std::cout << "=== Demo 20: Composite IOHandler + plain WarnFail ===\n";
+  {
+    ScriptedIO io{.answers = {"12", "4"}};
+    std::cout << "ratio: " << compute_ratio().run(io, WarnFail{}) << "\n\n";
+  }
+
+  // Demo 21: AllHandler covers Ask + Log + Fail in one struct.
+  //   compute_ratio : Fx<string, Ask, Log, Fail>
+  //   AllHandler{} satisfies all three with a single .run() argument.
+  //   Divide by zero fires Fail inside AllHandler.
+  std::cout << "=== Demo 21: AllHandler covers all three effects ===\n";
+  {
+    std::cout << "12/4 = " << compute_ratio().run(AllHandler{.answer = "4"})
+              << "\n";
+    std::cout << "12/0 result: "
+              << compute_ratio().run(AllHandler{.answer = "0"}) << "\n\n";
+  }
+
+  // Demo 22: Definition-time validation via VALIDATE_HANDLER.
+  //   Place VALIDATE_HANDLER(H) right after the struct's closing brace.
+  //   The static_assert fires immediately — before the type is ever used.
+  //   Uncomment either block to see the error at the VALIDATE_HANDLER line:
+  //
+  //   struct BrokenIO : IO::Handler<BrokenIO> {
+  //     void operator()(Ask e, auto r) { r("x"); }
+  //     // Log overload missing
+  //   };
+  //   VALIDATE_HANDLER(BrokenIO);
+  //   // error: 'BrokenIO' is missing operator() for one or more effects
+  //
+  //   struct BrokenFail : Fail::Handler<BrokenFail> {};
+  //   VALIDATE_HANDLER(BrokenFail);
+  //   // error: 'BrokenFail' is missing operator() for one or more effects
+
+  // Demo 23: handler<Row>() — inline composite handler from lambdas.
+  //   Lambdas are matched to effects by argument type; no struct needed.
+  //   Compile error on the handler<IO>() call if any effect has no lambda.
+  std::cout << "=== Demo 23: handler<IO> inline composite ===\n";
+  {
+    auto h = handler<IO>(
+        [](Ask e, auto r) {
+          std::cout << e.prompt << "inline\n";
+          r("inline");
+        },
+        [](Log e, auto r) {
+          std::cout << "[λ] " << e.message << "\n";
+          r({});
+        });
+    std::cout << greet().run(h) << "\n\n";
+  }
+
+  // Demo 24: handler<IO> + handler<Fail> covers all three effects together.
+  std::cout << "=== Demo 24: handler<IO> + handler<Fail> ===\n";
+  {
+    auto io = handler<IO>(
+        [](Ask e, auto r) {
+          std::cout << e.prompt << "4\n";
+          r("4");
+        },
+        [](Log e, auto r) {
+          std::cout << "[λ] " << e.message << "\n";
+          r({});
+        });
+    auto fail = handler<Fail>([](Fail e, auto r) {
+      std::cout << "[λ-fail] " << e.reason << "\n";
+      r(-1);
+    });
+    std::cout << "ratio: " << compute_ratio().run(io, fail) << "\n\n";
+  }
+
+  // Demo 25: Missing lambda — compile error at the handler<IO>() call site.
+  //   Uncomment to see the squiggle on handler<IO>(...):
+  //
+  //   auto h = handler<IO>(
+  //     [](Ask e, auto r) { r("x"); }
+  //     // Log lambda missing!
+  //   );
+  //   // error: constraint not satisfied — Log is not covered
 
   return 0;
 }
