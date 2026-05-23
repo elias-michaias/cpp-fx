@@ -25,7 +25,6 @@
 //  handler<E>(lambda)       -- wrap a lambda as a single-effect TypedHandler
 //  handler<Row>(l1, l2, ...) -- build an inline CompositeHandler for a Row
 //  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is
-//  complete Computation<T>           -- alias for Fx<T> (back-compat)
 #include <coroutine>
 #include <exception>
 #include <functional>
@@ -190,14 +189,12 @@ struct remove_from_list<T, type_list<Head, Tail...>> {
 // Being named concepts means GCC/Clang print the concept name in constraint
 // failure notes, making "which handler covered which effect" self-evident.
 template <typename E, typename H>
-concept SingleCoversEffect =
-    requires { typename H::effect_type; } &&
-    std::is_same_v<E, typename H::effect_type>;
+concept SingleCoversEffect = requires { typename H::effect_type; } &&
+                             std::is_same_v<E, typename H::effect_type>;
 
 template <typename E, typename H>
-concept CompositeCoversEffect =
-    requires { typename H::effect_types; } &&
-    contains_in_list_v<E, typename H::effect_types>;
+concept CompositeCoversEffect = requires { typename H::effect_types; } &&
+                                contains_in_list_v<E, typename H::effect_types>;
 
 // True if at least one handler in Hs... covers effect E.
 template <typename E, typename... Hs>
@@ -238,28 +235,29 @@ struct concat_lists<type_list<As...>, type_list<Bs...>> {
 
 // Convert one Row-or-Effectful argument to a type_list of bare effects.
 // If T has an ::effects member (i.e. it's a Row), expand it; otherwise wrap.
-template <typename T>
-struct to_effect_list { using type = type_list<T>; };
+template <typename T> struct to_effect_list {
+  using type = type_list<T>;
+};
 template <typename T>
   requires requires { typename T::effects; }
-struct to_effect_list<T> { using type = typename T::effects; };
+struct to_effect_list<T> {
+  using type = typename T::effects;
+};
 
 // Fold a pack of (Effectful | Row)... into a single flat type_list.
-template <typename... Ts>
-struct flatten_effects {
+template <typename... Ts> struct flatten_effects {
   using type = type_list<>;
 };
-template <typename T, typename... Rest>
-struct flatten_effects<T, Rest...> {
-  using type = typename concat_lists<
-      typename to_effect_list<T>::type,
-      typename flatten_effects<Rest...>::type>::type;
+template <typename T, typename... Rest> struct flatten_effects<T, Rest...> {
+  using type =
+      typename concat_lists<typename to_effect_list<T>::type,
+                            typename flatten_effects<Rest...>::type>::type;
 };
 template <typename... Ts>
 using flatten_effects_t = typename flatten_effects<Ts...>::type;
 
 // Build a BasicRow (defined below) from a type_list of Effectful types.
-template <typename List> struct row_from_list;  // defined after BasicRow
+template <typename List> struct row_from_list; // defined after BasicRow
 
 // Thin adapter: lets a composite handler serve as a single-effect TypedHandler.
 // Stored on the stack inside run_composite; H must outlive the adapter.
@@ -677,9 +675,6 @@ Fx<void, Es...> Fx<void, Es...>::promise_type::get_return_object() noexcept {
   return Fx{Handle::from_promise(*this)};
 }
 
-/// Back-compat alias — `Computation<T>` is the same as `Fx<T>` (no effects).
-template <typename T> using Computation = Fx<T>;
-
 // --- AnyFx concept ----------------------------------------------------------
 
 /// Matches any `Fx<T, Es...>` specialisation via structural detection.
@@ -694,9 +689,8 @@ concept AnyFx = requires {
 /// Used to constrain `handle<E>()` — when violated, the concept name itself
 /// describes the problem: "E is not declared in this computation's type."
 template <typename E, typename F>
-concept DeclaredIn =
-    Effectful<E> && AnyFx<F> &&
-    detail::contains_in_list_v<E, typename F::effect_list>;
+concept DeclaredIn = Effectful<E> && AnyFx<F> &&
+                     detail::contains_in_list_v<E, typename F::effect_list>;
 
 namespace detail {
 // Given Fx<T, E1, E2, E3> and E to remove → Fx<T, E1, E3>.
@@ -720,10 +714,10 @@ public:
 
   template <typename Promise>
   void await_suspend(std::coroutine_handle<Promise> caller) {
-    auto *payload = detail::pmr_new(
-        detail::Payload<E>{.effect_value = std::move(effect_),
-                           .caller = caller,
-                           .result_ptr = &result_});
+    auto *payload =
+        detail::pmr_new(detail::Payload<E>{.effect_value = std::move(effect_),
+                                           .caller = caller,
+                                           .result_ptr = &result_});
 
     caller.promise().effect_tag = &detail::effect_tag_v<E>;
     caller.promise().payload_ptr = payload;
@@ -819,8 +813,9 @@ template <Effectful... Es> struct BasicRow {
 
 namespace detail {
 template <typename List> struct row_from_list;
-template <Effectful... Es>
-struct row_from_list<type_list<Es...>> { using type = BasicRow<Es...>; };
+template <Effectful... Es> struct row_from_list<type_list<Es...>> {
+  using type = BasicRow<Es...>;
+};
 template <typename List>
 using row_from_list_t = typename row_from_list<List>::type;
 } // namespace detail
