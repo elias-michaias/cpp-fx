@@ -38,7 +38,7 @@ template <typename T> struct Emit : Effect<Emit<T>> {
 // ---- Named rows ------------------------------------------------------------
 
 using IO = Row<Ask, Log>;
-using All = Combine<IO, Row<Fail>>;
+using All = Row<IO, Fail>;
 
 // ---- Common handler structs ------------------------------------------------
 
