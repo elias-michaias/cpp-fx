@@ -6,7 +6,6 @@
 
 #include <iostream>
 #include <string>
-#include <vector>
 
 using namespace fx;
 
@@ -25,21 +24,20 @@ struct Log : Effect<Log> {
 };
 
 struct Fail : Effect<Fail> {
-  using result_type = int;   // handler resumes with a fallback integer
+  using result_type = int; // handler resumes with a fallback integer
   std::string reason;
 };
 
 // Emit<T> and Emit<U> are completely separate effects — each needs its own
 // handler.  The CRTP base gives Emit<T>::Fx<R> for free.
-template <typename T>
-struct Emit : Effect<Emit<T>> {
+template <typename T> struct Emit : Effect<Emit<T>> {
   T value;
   using result_type = std::monostate;
 };
 
 // ---- Named rows ------------------------------------------------------------
 
-using IO  = Row<Ask, Log>;
+using IO = Row<Ask, Log>;
 using All = Combine<IO, Row<Fail>>;
 
 // ---- Common handler structs ------------------------------------------------

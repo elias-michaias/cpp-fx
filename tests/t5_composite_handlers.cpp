@@ -27,7 +27,8 @@ let greet() -> IO::Fx<std::string> {
 }
 
 let safe_div(int a, int b) -> Fail::Fx<int> {
-  if (b == 0) co_return perform(Fail{.reason = "division by zero"});
+  if (b == 0)
+    co_return perform(Fail{.reason = "division by zero"});
   co_return a / b;
 }
 
@@ -42,7 +43,7 @@ let logged_div(int a, int b) -> Row<Log, Fail>::Fx<int> {
 let ratio() -> All::Fx<std::string> {
   let ns = perform(Ask{.prompt = "Numerator:   "});
   let ds = perform(Ask{.prompt = "Denominator: "});
-  let q  = co_await logged_div(std::stoi(ns), std::stoi(ds));
+  let q = co_await logged_div(std::stoi(ns), std::stoi(ds));
   co_return ns + "/" + ds + " = " + std::to_string(q);
 }
 
@@ -114,19 +115,22 @@ int main() {
 
   // 6. handler<IO>() — inline composite from lambdas, no struct needed.
   int log_count = 0;
-  auto h6 = handler<IO>(
-      [](Ask, auto r) { r(std::string{"inline"}); },
-      [&](Log, auto r) { ++log_count; r({}); });
+  auto h6 = handler<IO>([](Ask, auto r) { r(std::string{"inline"}); },
+                        [&](Log, auto r) {
+                          ++log_count;
+                          r({});
+                        });
   let r6 = greet().run(h6);
   assert(r6 == "Hello, inline!");
   assert(log_count == 2);
-  std::cout << "6. handler<IO> inline: " << r6 << " (" << log_count << " logs)\n";
+  std::cout << "6. handler<IO> inline: " << r6 << " (" << log_count
+            << " logs)\n";
 
   // 7. handler<IO>(lambdas) + handler<Fail>(lambda) for All::Fx<string>.
   int ask_idx = 0;
   std::array<const char *, 2> in{"6", "3"};
-  auto io7   = handler<IO>([&](Ask, auto r) { r(std::string{in[ask_idx++]}); },
-                            [](Log, auto r) { r({}); });
+  auto io7 = handler<IO>([&](Ask, auto r) { r(std::string{in[ask_idx++]}); },
+                         [](Log, auto r) { r({}); });
   auto fail7 = handler<Fail>([](Fail, auto r) { r(-1); });
   let r7 = ratio().run(io7, fail7);
   assert(r7 == "6/3 = 2");
@@ -134,7 +138,8 @@ int main() {
 
   // 8. VALIDATE_HANDLER demo — the structs above all pass.
   //    See invalid/05_incomplete_handler.cpp for the compile error case.
-  std::cout << "8. VALIDATE_HANDLER: ScriptedIO, ScriptedAll, WarnFail all OK\n";
+  std::cout
+      << "8. VALIDATE_HANDLER: ScriptedIO, ScriptedAll, WarnFail all OK\n";
 
   std::cout << "All tests passed.\n";
 }
