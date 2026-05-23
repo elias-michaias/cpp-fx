@@ -1,27 +1,29 @@
 #pragma once
 // effects.hpp -- Algebraic Effects & Handlers in C++23
-// Compile: g++ -std=c++23 -fcoroutines -O2   (GCC 13+)
-//      or: clang++ -std=c++23 -O2 -fcoroutines (Clang 17+)
 //
 // --- API -------------------------------------------------------------------
 //
 //  Effect<Self>     -- CRTP base; gives Self::Fx<R> and Self::Handler<Derived>
-//                      Use: struct MyEff : Effect<MyEff> { using result_type = T; };
-//  Handler H        -- callable  (E, std::function<void(E::result_type)>) -> void
+//                      Use: struct MyEff : Effect<MyEff> { using result_type =
+//                      T; };
+//  Handler H        -- callable  (E, std::function<void(E::result_type)>) ->
+//  void
 //
 //  E::Fx<T>                 -- coroutine return type for a single effect E
 //  Row<E1,E2>::Fx<T>        -- coroutine return type for multiple effects
 //  Fx<T>                    -- pure computation, no effects (zero-arg .run())
 //  perform(e)               -- co_await an effect inside an Fx
 //  handle<E>(comp, h)       -- install h for E; returns Fx with E removed
-//                              compile error if E is not in comp's declared effects
+//                              compile error if E is not in comp's declared
+//                              effects
 //  comp.run(h1, h2, ...)    -- validate ALL declared effects are handled, run
-//                              compile error if any declared effect lacks a handler
+//                              compile error if any declared effect lacks a
+//                              handler
 //  run_with(comp, h1, h2..) -- same as .run(), kept for backward compatibility
 //  handler<E>(lambda)       -- wrap a lambda as a single-effect TypedHandler
 //  handler<Row>(l1, l2, ...) -- build an inline CompositeHandler for a Row
-//  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is complete
-//  Computation<T>           -- alias for Fx<T> (back-compat)
+//  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is
+//  complete Computation<T>           -- alias for Fx<T> (back-compat)
 
 #include <coroutine>
 #include <exception>
@@ -132,9 +134,9 @@ struct remove_from_list<T, type_list<Head, Tail...>> {
                                   typename prepend_list<Head, rest>::type>;
 };
 
-// single_covers_v / composite_covers_v: SFINAE-safe per-handler coverage checks.
-template <typename E, typename H>
-inline constexpr bool single_covers_v = false;
+// single_covers_v / composite_covers_v: SFINAE-safe per-handler coverage
+// checks.
+template <typename E, typename H> inline constexpr bool single_covers_v = false;
 template <typename E, typename H>
   requires requires { typename H::effect_type; }
 inline constexpr bool single_covers_v<E, H> =
@@ -177,8 +179,7 @@ inline constexpr bool all_in_v<type_list<InnerEs...>, OuterEs...> =
 
 // Thin adapter: lets a composite handler serve as a single-effect TypedHandler.
 // Stored on the stack inside run_composite; H must outlive the adapter.
-template <typename H, Effectful E>
-struct EffectAdapter {
+template <typename H, Effectful E> struct EffectAdapter {
   using effect_type = E;
   H &h;
   void operator()(E e, std::function<void(typename E::result_type)> r) {
@@ -195,8 +196,8 @@ struct EffectAdapter {
 template <typename H>
 concept CompositeHandler =
     requires { typename std::remove_cvref_t<H>::effect_types; } &&
-    detail::all_effects_handled_v<std::remove_cvref_t<H>,
-                                  typename std::remove_cvref_t<H>::effect_types>;
+    detail::all_effects_handled_v<
+        std::remove_cvref_t<H>, typename std::remove_cvref_t<H>::effect_types>;
 
 // Forward-declare Fx and PerformAwaitable so promise_type can reference both.
 template <typename T, Effectful... Es> class Fx;
@@ -223,7 +224,8 @@ template <typename F> struct FxAwaitable {
 };
 
 // always_false_v: dependent false for static_assert in constrained templates.
-// Must depend on a template parameter so the assert only fires at instantiation.
+// Must depend on a template parameter so the assert only fires at
+// instantiation.
 template <typename...> inline constexpr bool always_false_v = false;
 
 // Shared promise_type base for Fx<T> and Fx<void>.
@@ -254,10 +256,13 @@ template <typename... Es> struct PromiseBase {
   template <typename T2, Effectful... InnerEs>
     requires all_in_v<type_list<InnerEs...>, Es...>
   FxAwaitable<Fx<T2, InnerEs...>>
-  await_transform(Fx<T2, InnerEs...> inner) noexcept { return {std::move(inner)}; }
+  await_transform(Fx<T2, InnerEs...> inner) noexcept {
+    return {std::move(inner)};
+  }
 
-  // Inner Fx has undeclared effects — deleted for IDE squiggles at co_await site.
-  // To fix: add the missing effect(s) to the return type: Row<..., E>::Fx<T>.
+  // Inner Fx has undeclared effects — deleted for IDE squiggles at co_await
+  // site. To fix: add the missing effect(s) to the return type: Row<...,
+  // E>::Fx<T>.
   template <typename T2, Effectful... InnerEs>
     requires(!all_in_v<type_list<InnerEs...>, Es...>)
   FxAwaitable<Fx<T2, InnerEs...>> await_transform(Fx<T2, InnerEs...>) = delete;
@@ -397,7 +402,7 @@ public:
   // Selected when any declared effect lacks a handler.
   // Add a handler for every effect listed in the return type.
   template <typename... Hs>
-    requires (!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
+    requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
   T run(Hs &&...) = delete;
 
   T _run() {
@@ -463,7 +468,8 @@ private:
   }
 
   template <typename H, typename... Rest>
-  void run_composite([[maybe_unused]] H &h, detail::type_list<>, Rest &...rest) {
+  void run_composite([[maybe_unused]] H &h, detail::type_list<>,
+                     Rest &...rest) {
     run_impl(rest...);
   }
 
@@ -484,7 +490,7 @@ public:
   // Selected when any declared effect lacks a handler.
   // Add a handler for every effect listed in the return type.
   template <typename... Hs>
-    requires (!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
+    requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
   void run(Hs &&...) = delete;
 
   void _run() {
@@ -611,8 +617,7 @@ template <Effectful... Es> struct Row {
   // Exposes the effect list for RowType concept and handler<R>().
   using effects = detail::type_list<Es...>;
 
-  template <typename Derived>
-  struct Handler {
+  template <typename Derived> struct Handler {
     using effect_types = detail::type_list<Es...>;
   };
 };
@@ -648,8 +653,7 @@ inline constexpr bool all_lambda_handled_v<type_list<Es...>, Lambdas...> =
 // Composite lambda handler returned by handler<Row>(...).
 // Dispatches each incoming effect to the first lambda whose argument type
 // matches; satisfies CompositeHandler so it can be passed directly to .run().
-template <RowType R, typename... Lambdas>
-struct CompositeLambdaHandler {
+template <RowType R, typename... Lambdas> struct CompositeLambdaHandler {
   using effect_types = typename R::effects;
   std::tuple<Lambdas...> fns;
 
@@ -696,8 +700,7 @@ template <typename Self> struct Effect {
   // Inherit as:  struct MyHandler : MyEffect::Handler<MyHandler> { ... }
   // Then provide operator()(MyEffect, auto resume).
   // The TypedHandler concept validates the overload is present.
-  template <typename Derived>
-  struct Handler {
+  template <typename Derived> struct Handler {
     using effect_type = Self;
   };
 };
