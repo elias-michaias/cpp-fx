@@ -43,7 +43,7 @@ namespace test_state {
 
 using namespace fx::state;
 
-static auto count_down(int n) -> StateRow<int>::Fx<int> {
+static auto count_down(int n) -> State<int>::Fx<int> {
     int sum = 0;
     for (int i = 0; i < n; ++i) {
         int s = perform(Get<int>{});

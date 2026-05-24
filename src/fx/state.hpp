@@ -37,7 +37,7 @@ struct Put : fx::Effect<Put<S>> {
 };
 
 template <typename S>
-using StateRow = fx::Row<Get<S>, Put<S>>;
+using State = fx::Row<Get<S>, Put<S>>;
 
 // --- Handler implementation (opaque; users never name this type) -------------
 
@@ -47,8 +47,7 @@ namespace detail {
 // Stores a raw pointer to the live state so copies of the handler
 // (made by run()) all see the same variable.
 template <typename S>
-struct StateHandler {
-    using effect_types = fx::detail::type_list<Get<S>, Put<S>>;
+struct StateHandler : State<S>::Handler<StateHandler<S>> {
     S *ptr;
     void operator()(Get<S>,    auto r) const { r(*ptr); }
     void operator()(Put<S> p,  auto r)       { *ptr = std::move(p.value); r({}); }
