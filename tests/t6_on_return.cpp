@@ -61,14 +61,14 @@ static auto ask_log_div(int a, int b) -> Row<Ask, Log, Fail>::Fx<int> {
 // Handles Fail by resuming with 0; on_return converts int → string.
 struct IntToStr : Fail::Handler<IntToStr> {
   void operator()(Fail, auto r) { r(0); }
-  auto on_return(int v) -> std::string { return std::to_string(v); }
+  auto on_return(auto v) -> std::string { return std::to_string(v); }
 };
 VALIDATE_HANDLER(IntToStr);
 
 // Dual-mode: abort (→ nullopt) on Fail; on_return wraps success int → optional<int>.
 struct FailToOpt : Fail::Handler<FailToOpt> {
   auto operator()(Fail, auto) -> std::optional<int> { return std::nullopt; }
-  auto on_return(int v) -> std::optional<int> { return v; }
+  auto on_return(auto v) -> std::optional<int> { return v; }
 };
 VALIDATE_HANDLER(FailToOpt);
 
@@ -278,37 +278,33 @@ static void test_composite_handler_on_return() {
   PASS("10. composite handler on_return: Ask+Log handler wraps int→tuple<int,string,int>");
 }
 
-// 11. Intercepting handler: capture effect state, then annotate the result.
+// 11. Intercepting handler using TypedResume — Koka-style polymorphic T.
 //
-//     operator() stores whatever it needs from the effect as handler member
-//     state, then resumes normally.  on_return receives the final result and
-//     can combine it with that stored state — giving the handler a view of
-//     both what was performed and what the computation ultimately returned.
+//     operator() is a function template: T is deduced from the TypedResume
+//     token passed by the framework, so the handler doesn't need to know T
+//     upfront.  This enables patterns like JSON::deserialize<T>(), caching,
+//     metrics, etc. that are generic over whatever the computation returns.
 static auto prompt_length() -> Ask::Fx<int> {
   auto answer = perform(Ask{.prompt = "length of what?"});
   co_return static_cast<int>(answer.size());
 }
 
 struct AnnotatedAsk : Ask::Handler<AnnotatedAsk> {
-  std::string last_prompt;
-
-  void operator()(Ask e, auto k) {
-    last_prompt = e.prompt;     // (1) capture the effect payload
-    k("hello");                 // (2) resume normally with chosen value
-  }
-  // on_return sees BOTH the captured effect state AND the final result:
-  auto on_return(int len) -> std::string {
-    return "Q=[" + last_prompt + "] A_len=" + std::to_string(len);
+  // T is deduced as `int` here (the computation returns int).
+  // The handler never mentions int — it works for any non-void T.
+  template <typename T>
+  auto operator()(Ask e, fx::TypedResume<Ask, T> k) -> std::string {
+    T len = k.resume_and_get("hello");   // T deduced, no explicit <int>
+    return "Q=[" + e.prompt + "] A_len=" + std::to_string(len);
   }
 };
+VALIDATE_HANDLER(AnnotatedAsk);
 
 static void test_capture_effect_then_on_return() {
-  AnnotatedAsk h;
-  // prompt_length(): performs Ask → h resumes with "hello" (5 chars) →
-  //   on_return(5) has access to last_prompt and len simultaneously.
-  auto result = prompt_length().run(h);
+  auto result = prompt_length().run(AnnotatedAsk{});
+  static_assert(std::is_same_v<decltype(result), std::string>);
   assert(result == "Q=[length of what?] A_len=5");
-  PASS("11. capture effect payload + on_return: see both effect and final result");
+  PASS("11. TypedResume: template operator() deduces T; k.resume_and_get needs no <T>");
 }
 
 // ---- Main -------------------------------------------------------------------

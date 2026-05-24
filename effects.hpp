@@ -62,12 +62,44 @@ struct Resume {
   void operator()(typename E::result_type v) const;
 };
 
-/// Satisfied when H can be called as `h(e, r)` where `e : E` and `r : Resume<E>`.
-/// Use `auto r` in the handler signature — Resume<E> is not std::function.
+/// Resume token that also carries the computation's final result type `T`.
+///
+/// This is what ScopedHandler passes to the handler's operator() when it
+/// knows the inner result type (i.e. inside run_push for a TypedHandler).
+/// Handlers that write `auto k` in their signature receive this type, so they
+/// can call `k.resume_and_get(value)` to drive the computation to completion
+/// and get `T` back — without an explicit template argument.
+///
+/// For polymorphism over T, write a template operator():
+///
+///   struct CacheHit : Ask::Handler<CacheHit> {
+///     std::map<std::string, std::any> cache;
+///     template <typename T>
+///     auto operator()(Ask e, TypedResume<Ask, T> k) -> T {
+///       T result = k.resume_and_get("value");
+///       cache[e.prompt] = result;  // JSON::serialize(result), metrics, etc.
+///       return result;             // passthrough
+///     }
+///   };
+///
+/// Inherits from Resume<E> so handlers that take an explicit `Resume<E>`
+/// parameter continue to work unchanged.
+template <Effectful E, typename T>
+struct TypedResume : Resume<E> {
+  explicit TypedResume(PerformAwaitable<E> *pa) noexcept : Resume<E>{pa} {}
+  /// Drive the continuation to completion and return the final result as T.
+  /// Equivalent to fx::resume_and_get<T>(*this, v) without the explicit <T>.
+  T resume_and_get(typename E::result_type v) const; // defined after fx::resume_and_get
+};
+
+/// Satisfied when H can be called as `h(e, r)` where `e : E` and
+/// `r : TypedResume<E, int>` (a probe T — any TypedResume<E, *> works).
+/// Use `auto r` in the handler signature; the actual T is deduced at the
+/// call site and forwarded by ScopedHandler.
 template <typename H, typename E>
 concept HandlerFor =
     Effectful<E> &&
-    requires(std::remove_cvref_t<H> &h, E e, Resume<E> r) { h(e, r); };
+    requires(std::remove_cvref_t<H> &h, E e, TypedResume<E, int> r) { h(e, r); };
 
 /// Satisfied by handler objects that advertise their target effect via
 /// an `effect_type` alias (produced by `Effect::Handler<Derived>` or
@@ -113,6 +145,15 @@ struct PromiseAbortBase {
   bool        aborted     = false;
   void       *abort_owner = nullptr; // address of the handler that aborted
   std::any    abort_value;           // typed abort value, set by aborting handler
+
+  // Moved here from PromiseBase so that resume_and_get can reach them
+  // through the non-templated abort_base_ pointer on PerformAwaitable.
+  const void        *effect_tag  = nullptr;
+  void              *payload_ptr = nullptr;
+  std::exception_ptr exception;
+  // Points to the std::optional<T> result member inside the typed promise.
+  // Set by get_return_object().  Null for Fx<void> computations.
+  void              *result_ptr  = nullptr;
 };
 
 struct HandlerNode {
@@ -264,14 +305,46 @@ template <typename H, typename InnerR>
 using on_return_t =
     decltype(std::declval<std::remove_cvref_t<H> &>().on_return(std::declval<InnerR>()));
 
-// Fold right over handler list: last handler (innermost) wraps T first.
-// Handlers without a on_return are identity transforms.
-// Uses a helper struct to avoid eager instantiation of on_return_t
-// in the false branch (std::conditional_t instantiates both).
-template <typename H, typename InnerR, bool = HasReturnClause<H, InnerR>>
-struct compose_one { using type = InnerR; };
+// Does this TypedHandler's operator()(E, TypedResume<E, InnerR>) return non-void?
+// InnerR is the computation's actual result type at this point in the handler
+// chain — threading it through here is what makes polymorphic-T operators work:
+//
+//   template <typename T>
+//   auto operator()(E e, TypedResume<E, T> k) -> T { ... }  // passthrough: InnerR=T
+//
+//   auto operator()(E e, auto k) -> std::string { ... }     // fixed output type
+//
 template <typename H, typename InnerR>
-struct compose_one<H, InnerR, true> { using type = on_return_t<H, InnerR>; };
+concept HasDrivingOperatorFor =
+    TypedHandler<H> &&
+    !std::is_void_v<decltype(std::declval<std::remove_cvref_t<H> &>()(
+        std::declval<typename std::remove_cvref_t<H>::effect_type>(),
+        std::declval<TypedResume<typename std::remove_cvref_t<H>::effect_type,
+                                 InnerR>>()))>;
+
+// What type does that operator() return (given InnerR as T)?
+template <typename H, typename InnerR>
+  requires HasDrivingOperatorFor<H, InnerR>
+using driving_return_for_t =
+    decltype(std::declval<std::remove_cvref_t<H> &>()(
+        std::declval<typename std::remove_cvref_t<H>::effect_type>(),
+        std::declval<TypedResume<typename std::remove_cvref_t<H>::effect_type,
+                                 InnerR>>()));
+
+// Fold right over handler list: last handler (innermost) wraps T first.
+// Priority: on_return > driving operator > identity.
+template <typename H, typename InnerR,
+          bool HasReturn  = HasReturnClause<H, InnerR>,
+          bool HasDriving = HasDrivingOperatorFor<H, InnerR>>
+struct compose_one { using type = InnerR; };
+// on_return wins when present (handles both abort and success paths).
+template <typename H, typename InnerR, bool HasDriving>
+struct compose_one<H, InnerR, true, HasDriving> { using type = on_return_t<H, InnerR>; };
+// No on_return but operator() returns non-void (drives via resume_and_get):
+// the operator's return type IS the result — passthrough handlers produce InnerR,
+// transform handlers produce whatever their return type is.
+template <typename H, typename InnerR>
+struct compose_one<H, InnerR, false, true> { using type = driving_return_for_t<H, InnerR>; };
 
 template <typename T, typename... Hs> struct composed_return {
   using type = T;
@@ -323,11 +396,9 @@ template <typename F> struct FxAwaitable {
 };
 
 // Shared promise_type base for Fx<T> and Fx<void>.
-// Holds the coroutine state and all await_transform overloads in one place.
+// effect_tag, payload_ptr, exception, and result_ptr live in PromiseAbortBase
+// so resume_and_get can reach them through the non-templated abort_base_ ptr.
 template <typename... Es> struct PromiseBase : PromiseAbortBase {
-  std::exception_ptr exception;
-  const void *effect_tag = nullptr;
-  void *payload_ptr = nullptr;
 
   std::suspend_always initial_suspend() noexcept { return {}; }
   std::suspend_always final_suspend() noexcept { return {}; }
@@ -418,7 +489,13 @@ using remove_effect_t = detail::fx_from_list_t<
 
 // --- ScopedHandler ----------------------------------------------------------
 
-template <Effectful E, typename H>
+/// `ResultT` is the computation's result type at this handler's level.
+/// When non-void (set by run_push for TypedHandlers), the dispatch lambda
+/// passes a `TypedResume<E, ResultT>` so the handler's template operator()
+/// can deduce T without an explicit template argument.
+/// Composite handlers and handle<E>() use the default `void`, which falls
+/// back to passing the plain `Resume<E>` (no driving-operator support needed).
+template <Effectful E, typename H, typename ResultT = void>
   requires HandlerFor<H, E>
 struct ScopedHandler {
   detail::HandlerNode node;
@@ -436,12 +513,16 @@ struct ScopedHandler {
       auto *n  = reinterpret_cast<detail::HandlerNode *>(node_self);
       auto &hh = *reinterpret_cast<std::remove_reference_t<H> *>(n->real_handler_ptr);
       auto *pa = reinterpret_cast<PerformAwaitable<E> *>(raw);
-      using Ret = decltype(hh(pa->effect_, Resume<E>{pa}));
+      // Pass TypedResume<E, ResultT> when ResultT is known; fall back to
+      // plain Resume<E> for composite handlers / handle<E>() (ResultT=void).
+      using Token = std::conditional_t<std::is_void_v<ResultT>,
+                                       Resume<E>, TypedResume<E, ResultT>>;
+      using Ret = decltype(hh(pa->effect_, Token{pa}));
       if constexpr (std::is_void_v<Ret>) {
-        hh(pa->effect_, Resume<E>{pa}); // calls r() → resumes coroutine
+        hh(pa->effect_, Token{pa}); // calls r() → resumes coroutine
       } else {
         // Handler returned non-void: abort path. Must NOT call r().
-        auto val = hh(pa->effect_, Resume<E>{pa});
+        auto val = hh(pa->effect_, Token{pa});
         pa->abort_base_->aborted     = true;
         pa->abort_base_->abort_owner = n->handler_obj; // = &node or group_id
         pa->abort_base_->abort_value = std::any(std::move(val));
@@ -553,7 +634,9 @@ private:
     using Hb     = std::remove_cvref_t<H>;
     using InnerR = detail::composed_return_t<T, Rest...>;
     using R      = detail::composed_return_t<T, H, Rest...>;
-    ScopedHandler<typename Hb::effect_type, Hb> guard{h};
+    // Pass InnerR so the dispatch lambda can construct TypedResume<E, InnerR>
+    // and the handler's template operator() can deduce T = InnerR.
+    ScopedHandler<typename Hb::effect_type, Hb, InnerR> guard{h};
     auto inner = run_push(rest...);
     auto *ab   = get_abort_base();
     // Did THIS handler abort? Compare against the node's own address (unique
@@ -566,6 +649,10 @@ private:
     // Normal path — apply return clause if declared.
     if constexpr (detail::HasReturnClause<Hb, InnerR>)
       return std::optional<R>{h.on_return(std::move(*inner))};
+    else if constexpr (detail::HasDrivingOperatorFor<Hb, InnerR>)
+      // Driving handler (uses resume_and_get) always aborts; if we reach here
+      // the effect was never performed — that is a logic error.
+      std::unreachable();
     else
       return inner; // R == InnerR, move the optional as-is
   }
@@ -670,6 +757,7 @@ public:
 
 template <typename T, Effectful... Es>
 Fx<T, Es...> Fx<T, Es...>::promise_type::get_return_object() noexcept {
+  this->result_ptr = &result; // lets resume_and_get retrieve T without knowing Es
   return Fx{Handle::from_promise(*this)};
 }
 
@@ -843,6 +931,50 @@ template <Effectful E>
 void Resume<E>::operator()(typename E::result_type v) const {
   pa->result_ = std::move(v);
   pa->caller_.resume();
+}
+
+/// Resume the coroutine with `v`, drive it to completion through the
+/// already-installed handler stack, and return its final result as `T`.
+///
+/// Use this inside a handler's `operator()` instead of calling `k(v)` when
+/// you want to observe the computation's result inline — Koka-style:
+///
+///   struct Intercept : Ask::Handler<Intercept> {
+///     auto operator()(Ask e, auto k) -> std::string {
+///       int len = fx::resume_and_get<int>(k, "hello");
+///       return "prompt=[" + e.prompt + "] len=" + std::to_string(len);
+///     }
+///   };
+///
+/// The value returned from `operator()` becomes the final `.run()` result,
+/// exactly as if an `on_return` clause had produced it.  No `on_return` is
+/// needed when using `resume_and_get`.
+///
+/// Preconditions:
+///   - `T` must be the non-void return type of the enclosing `Fx<T, ...>`.
+///   - `k` must not have been called already (single-shot).
+///   - If a nested handler aborts during the drive, `std::runtime_error` is thrown.
+template <typename T, Effectful E>
+  requires (!std::is_void_v<T>)
+T resume_and_get(Resume<E> k, typename E::result_type v) {
+  k.pa->result_ = std::move(v);
+  auto *ab = k.pa->abort_base_;
+  k.pa->caller_.resume();
+  while (!k.pa->caller_.done()) {
+    detail::dispatch_effect(ab->effect_tag, ab->payload_ptr);
+    if (ab->aborted)
+      throw std::runtime_error(
+          "fx::resume_and_get: computation aborted by a nested handler");
+  }
+  if (ab->exception) std::rethrow_exception(ab->exception);
+  return std::move(**static_cast<std::optional<T> *>(ab->result_ptr));
+}
+
+// Out-of-line body for TypedResume<E,T>::resume_and_get.
+// Must be defined after fx::resume_and_get since it delegates to it.
+template <Effectful E, typename T>
+T TypedResume<E, T>::resume_and_get(typename E::result_type v) const {
+  return ::fx::resume_and_get<T>(*this, std::move(v));
 }
 
 namespace detail {
