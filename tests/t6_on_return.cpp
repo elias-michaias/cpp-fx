@@ -516,6 +516,15 @@ static void test_three_level_cont_pipeline() {
        "on_return (int→pair): int→int→pair<int,int>");
 }
 
+struct HandleLog : Log::Handler<HandleLog> {
+  std::vector<std::string> captured;
+
+  void handle(Log e, auto r) {
+    captured.push_back(e.message);
+    r({});
+  };
+};
+
 // 16. Same computation, two completely different handler pipelines.
 //     Demonstrates that the handler pipeline — not the computation — determines
 //     the result type; swapping handlers changes the type at compile time.
@@ -523,19 +532,15 @@ static void test_three_level_cont_pipeline() {
 //     Pipeline A: AnnotateCont + CaptureLog → string
 //     Pipeline B: LogCount<int> + SpyAsk    → pair<int,int>
 static void test_same_comp_different_pipelines() {
-  // Pipeline A: Cont annotator drives through a reference-capturing log lambda;
-  // int→string.
+  // Pipeline A: Cont annotator drives through a pre-instantiated log struct
+  // with persisting state; int→string.
   {
-    std::vector<std::string> captured;
-    auto log_h = handler<Log>([&](Log e, auto r) {
-      captured.push_back(e.message);
-      r({});
-    });
+    HandleLog log_h;
     auto r = ask_multiply(3, 4).run(AnnotateCont{.given = "mul"}, log_h);
     static_assert(std::is_same_v<decltype(r), std::string>);
     assert(r == "[label?→mul]=12");
-    assert(captured.size() == 1u);
-    assert(captured[0] == "mul:3*4");
+    assert(log_h.captured.size() == 1u);
+    assert(log_h.captured[0] == "mul:3*4");
   }
   // Pipeline B: inner spy (T→T) + outer LogCount (on_return);
   // int→pair<int,int>.

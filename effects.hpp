@@ -356,14 +356,19 @@ struct compose_one<H, InnerR, true, HasDriving> {
 };
 // Lazy wrapper used by compose_one to avoid eagerly instantiating on_return_t
 // when HasReturnClause<H, DrivingR> is false.
-template <typename H, typename R> struct lazy_on_return { using type = on_return_t<H, R>; };
-template <typename R> struct lazy_identity { using type = R; };
+template <typename H, typename R> struct lazy_on_return {
+  using type = on_return_t<H, R>;
+};
+template <typename R> struct lazy_identity {
+  using type = R;
+};
 
 // No on_return for InnerR, but operator() returns non-void (drives via resume).
 // If on_return IS defined for the driving result type (DrivingR), chain it so
 // that handle() drives first and on_return() wraps the result.
 // Passthrough handlers (DrivingR == InnerR, no on_return) produce InnerR.
-// Transform handlers (DrivingR != InnerR) produce DrivingR or on_return_t if chained.
+// Transform handlers (DrivingR != InnerR) produce DrivingR or on_return_t if
+// chained.
 template <typename H, typename InnerR>
 struct compose_one<H, InnerR, false, true> {
   using DrivingR = driving_return_for_t<H, InnerR>;
@@ -772,7 +777,7 @@ public:
   template <typename... Hs>
     requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
   auto run(Hs &&...hs) {
-    auto locals = std::make_tuple(std::forward<Hs>(hs)...);
+    auto locals = std::tie(hs...);
     return *std::apply([this](auto &...lhs) { return run_push(lhs...); },
                        locals);
   }
@@ -882,7 +887,7 @@ public:
   template <typename... Hs>
     requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
   void run(Hs &&...hs) {
-    auto locals = std::make_tuple(std::forward<Hs>(hs)...);
+    auto locals = std::tie(hs...);
     std::apply([this](auto &...lhs) { run_push(lhs...); }, locals);
   }
 
