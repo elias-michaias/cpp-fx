@@ -128,7 +128,7 @@ int main() {
       << "Notes:\n"
       << "  exceptions: fast on happy path; each throw is expensive.\n"
       << "  std::optional: uniform cost regardless of failure rate.\n"
-      << "  Fail effect: also uniform; overhead is the per-perform Payload alloc.\n"
+      << "  Fail effect: also uniform; overhead is handler stack walk + resume.\n"
       << "               propagation is automatic — no manual .value_or() needed.\n";
   return 0;
 }

@@ -10,7 +10,7 @@
 //   5. Emit<int> effect (fx)           — perform per value, full library
 //
 // The gap between (4) and (5) shows the extra cost introduced by the fx
-// machinery (handler stack walk + Payload allocation) over bare co_yield.
+// machinery (handler stack walk + resume) over bare co_yield.
 // The gap between (1) and (4) shows the raw co_yield / coroutine cost.
 
 #include "../common.hpp"
@@ -147,7 +147,7 @@ int main() {
   std::cout
       << "\nNotes:\n"
       << "  raw generator ≈ Emit<int>: both suspend/resume per value.\n"
-      << "  Emit<int> adds handler-stack walk + Payload alloc per yield.\n"
+      << "  Emit<int> adds handler-stack walk + resume per yield (zero extra alloc).\n"
       << "  The gap vs callback = coroutine overhead.\n"
       << "  Emit<int> advantage: producer and consumer are fully decoupled;\n"
       << "  handlers are swappable without changing the producer.\n";

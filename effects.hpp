@@ -110,36 +110,8 @@ inline thread_local std::pmr::memory_resource *current_mr = nullptr;
 
 template <Effectful E> inline constexpr char effect_tag_v = 0;
 
-/// Per-perform payload passed from PerformAwaitable to the handler dispatch.
-/// Stores the effect value, the suspended coroutine's handle (type-erased),
-/// and a direct pointer into the awaitable's result slot — no heap allocation
-/// for the resume callable.
-template <Effectful E> struct Payload {
-  E effect_value;
-  std::coroutine_handle<> caller;
-  typename E::result_type *result_ptr;
-};
-
-/// Allocate one T using current_mr (or global new if none is installed).
-/// The object is move-constructed from `obj`.
-template <typename T> T *pmr_new(T obj) {
-  if (auto *mr = current_mr) {
-    void *raw = mr->allocate(sizeof(T), alignof(T));
-    return ::new (raw) T{std::move(obj)};
-  }
-  return new T{std::move(obj)};
-}
-
-/// Deallocate a T previously allocated by pmr_new using current_mr.
-/// Calls the destructor and returns memory to the active resource.
-template <typename T> void pmr_delete(T *ptr) noexcept {
-  if (auto *mr = current_mr) {
-    ptr->~T();
-    mr->deallocate(ptr, sizeof(T), alignof(T));
-  } else {
-    delete ptr;
-  }
-}
+// (Payload<E>, pmr_new, pmr_delete removed — per-perform data lives
+//  directly in PerformAwaitable on the coroutine frame; no heap alloc.)
 
 inline void dispatch_effect(const void *tag, void *payload_ptr) {
   for (auto *n = stack_top; n; n = n->prev) {
@@ -259,15 +231,7 @@ using flatten_effects_t = typename flatten_effects<Ts...>::type;
 // Build a BasicRow (defined below) from a type_list of Effectful types.
 template <typename List> struct row_from_list; // defined after BasicRow
 
-// Thin adapter: lets a composite handler serve as a single-effect TypedHandler.
-// Stored on the stack inside run_composite; H must outlive the adapter.
-template <typename H, Effectful E> struct EffectAdapter {
-  using effect_type = E;
-  H &h;
-  void operator()(E e, std::function<void(typename E::result_type)> r) {
-    h(std::move(e), std::move(r));
-  }
-};
+
 
 } // namespace detail
 
@@ -415,15 +379,12 @@ struct ScopedHandler {
     node.dispatch = [](void *hobj, void *raw) {
       using R = typename E::result_type;
       auto &hh = *reinterpret_cast<std::remove_reference_t<H> *>(hobj);
-      auto *pl = reinterpret_cast<detail::Payload<E> *>(raw);
-      // lambda captures one pointer — fits in std::function SBO, no heap alloc
-      std::function<void(R)> resume = [pl](R v) {
-        *pl->result_ptr = std::move(v);
-        auto caller = pl->caller;
-        detail::pmr_delete(pl);
-        caller.resume();
+      auto *pa = reinterpret_cast<PerformAwaitable<E> *>(raw);
+      std::function<void(R)> resume = [pa](R v) {
+        pa->result_ = std::move(v);
+        pa->caller_.resume();
       };
-      hh(pl->effect_value, std::move(resume));
+      hh(pa->effect_, std::move(resume));
     };
     saved = detail::stack_top;
     node.prev = saved;
@@ -499,35 +460,35 @@ private:
   using Impl = std::variant<OwnedHandle, Fn>;
   Impl impl_;
 
-  // Base case: drives the coroutine.
-  T run_impl() { return _run(); }
+  // Base: all handlers pushed; drive the coroutine.
+  T run_push() { return _run(); }
 
-  // Single-effect handler.
+  // Single TypedHandler: push onto thread-local stack, recurse.
   template <TypedHandler H, typename... Rest>
     requires(!CompositeHandler<std::remove_cvref_t<H>>)
-  T run_impl(H &h, Rest &...rest) {
+  T run_push(H &h, Rest &...rest) {
     using Hb = std::remove_cvref_t<H>;
     ScopedHandler<typename Hb::effect_type, Hb> guard{h};
-    return run_impl(rest...);
+    return run_push(rest...);
   }
 
-  // Composite handler: expand each effect in effect_types into an adapter.
+  // CompositeHandler: push one ScopedHandler per declared effect.
   template <CompositeHandler H, typename... Rest>
-  T run_impl(H &h, Rest &...rest) {
-    return run_composite(h, typename std::remove_cvref_t<H>::effect_types{},
-                         rest...);
+  T run_push(H &h, Rest &...rest) {
+    return run_push_composite(h,
+        typename std::remove_cvref_t<H>::effect_types{}, rest...);
   }
 
   template <typename H, Effectful First, Effectful... Rem, typename... Rest>
-  T run_composite(H &h, detail::type_list<First, Rem...>, Rest &...rest) {
-    detail::EffectAdapter<H, First> adapter{h};
-    ScopedHandler<First, detail::EffectAdapter<H, First>> guard{adapter};
-    return run_composite(h, detail::type_list<Rem...>{}, rest...);
+  T run_push_composite(H &h, detail::type_list<First, Rem...>, Rest &...rest) {
+    ScopedHandler<First, H> guard{h};
+    return run_push_composite(h, detail::type_list<Rem...>{}, rest...);
   }
 
   template <typename H, typename... Rest>
-  T run_composite([[maybe_unused]] H &h, detail::type_list<>, Rest &...rest) {
-    return run_impl(rest...);
+  T run_push_composite([[maybe_unused]] H &h, detail::type_list<>,
+                       Rest &...rest) {
+    return run_push(rest...);
   }
 
 public:
@@ -537,27 +498,37 @@ public:
   Fx(const Fx &) = delete;
   Fx &operator=(const Fx &) = delete;
 
-  /// Executes the computation with the supplied handlers and returns `T`.
+/// Execute with handler types as template parameters (default-constructs
+  /// each handler).  Compile error if any declared effect is unhandled.
   ///
-  /// A handler for every effect in `Es...` must be provided — either a
-  /// `TypedHandler` (struct or `handler<E>(lambda)`) or a `CompositeHandler`
-  /// (row handler struct or `handler<Row>(lambdas...)`).
+  ///   comp.run<MyAsk, MyLog>();
+  template <typename... Hs>
+    requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
+          && (std::default_initializable<Hs> && ...)
+  T run() {
+    std::tuple<Hs...> locals{};
+    return std::apply(
+        [this](auto &...hs) -> T { return run_push(hs...); }, locals);
+  }
+
+  /// @cond — deleted fallback for run<Hs...>() when coverage is incomplete.
+  template <typename... Hs>
+    requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
+  T run() = delete;
+  /// @endcond
+
+  /// Execute with handler instances.  Compile error if any effect is unhandled.
   ///
-  /// If any declared effect is unhandled this overload is removed from
-  /// the candidate set; the deleted overload below is selected instead,
-  /// giving an IDE squiggle and a "use of deleted function" error.
+  ///   comp.run(MyAsk{...}, MyLog{...});
   template <typename... Hs>
     requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
   T run(Hs &&...hs) {
-    // Store handlers so temporaries outlive _run().
     auto locals = std::make_tuple(std::forward<Hs>(hs)...);
     return std::apply(
-        [this](auto &...local_hs) -> T { return run_impl(local_hs...); },
-        locals);
+        [this](auto &...lhs) -> T { return run_push(lhs...); }, locals);
   }
 
   /// @cond — deleted fallback; triggers IDE squiggle when a handler is missing.
-  /// Fix: supply a handler for every effect listed in the return type.
   template <typename... Hs>
     requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
   T run(Hs &&...) = delete;
@@ -603,32 +574,33 @@ private:
   using Impl = std::variant<OwnedHandle, Fn>;
   Impl impl_;
 
-  void run_impl() { _run(); }
+  void run_push() { _run(); }
 
   template <TypedHandler H, typename... Rest>
     requires(!CompositeHandler<std::remove_cvref_t<H>>)
-  void run_impl(H &h, Rest &...rest) {
+  void run_push(H &h, Rest &...rest) {
     using Hb = std::remove_cvref_t<H>;
     ScopedHandler<typename Hb::effect_type, Hb> guard{h};
-    run_impl(rest...);
+    run_push(rest...);
   }
 
   template <CompositeHandler H, typename... Rest>
-  void run_impl(H &h, Rest &...rest) {
-    run_composite(h, typename std::remove_cvref_t<H>::effect_types{}, rest...);
+  void run_push(H &h, Rest &...rest) {
+    run_push_composite(h,
+        typename std::remove_cvref_t<H>::effect_types{}, rest...);
   }
 
   template <typename H, Effectful First, Effectful... Rem, typename... Rest>
-  void run_composite(H &h, detail::type_list<First, Rem...>, Rest &...rest) {
-    detail::EffectAdapter<H, First> adapter{h};
-    ScopedHandler<First, detail::EffectAdapter<H, First>> guard{adapter};
-    run_composite(h, detail::type_list<Rem...>{}, rest...);
+  void run_push_composite(H &h, detail::type_list<First, Rem...>,
+                          Rest &...rest) {
+    ScopedHandler<First, H> guard{h};
+    run_push_composite(h, detail::type_list<Rem...>{}, rest...);
   }
 
   template <typename H, typename... Rest>
-  void run_composite([[maybe_unused]] H &h, detail::type_list<>,
-                     Rest &...rest) {
-    run_impl(rest...);
+  void run_push_composite([[maybe_unused]] H &h, detail::type_list<>,
+                          Rest &...rest) {
+    run_push(rest...);
   }
 
 public:
@@ -638,17 +610,30 @@ public:
   Fx(const Fx &) = delete;
   Fx &operator=(const Fx &) = delete;
 
-  /// Same semantics as `Fx<T>::run()` — executes the computation.
-  /// Every effect in `Es...` must have a matching handler.
+  /// Execute with handler types as template parameters (default-constructs each).
+  template <typename... Hs>
+    requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
+          && (std::default_initializable<Hs> && ...)
+  void run() {
+    std::tuple<Hs...> locals{};
+    std::apply([this](auto &...hs) { run_push(hs...); }, locals);
+  }
+
+  /// @cond deleted fallback for run<Hs...>() when coverage is incomplete.
+  template <typename... Hs>
+    requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
+  void run() = delete;
+  /// @endcond
+
+  /// Execute with handler instances.
   template <typename... Hs>
     requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
   void run(Hs &&...hs) {
     auto locals = std::make_tuple(std::forward<Hs>(hs)...);
-    std::apply([this](auto &...local_hs) { run_impl(local_hs...); }, locals);
+    std::apply([this](auto &...lhs) { run_push(lhs...); }, locals);
   }
 
-  /// @cond — deleted fallback; triggers IDE squiggle when a handler is missing.
-  /// Fix: supply a handler for every effect listed in the return type.
+  /// @cond deleted fallback when a handler is missing.
   template <typename... Hs>
     requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
   void run(Hs &&...) = delete;
@@ -706,6 +691,10 @@ using remove_effect_from_fx_t =
 /// dispatches the effect value to the nearest matching handler on the thread-
 /// local stack, and resumes with the handler's reply value.
 /// Use the `perform(e)` macro rather than constructing this directly.
+/// Awaitable produced by `perform(e)`.  Stores all per-perform state
+/// directly in this object (which lives on the coroutine frame) — no
+/// heap allocation.  `await_suspend` just records the caller handle and
+/// the effect tag; the `_run()` dispatch loop does the actual dispatch.
 template <Effectful E> class [[nodiscard]] PerformAwaitable {
 public:
   explicit PerformAwaitable(E e) : effect_(std::move(e)) {}
@@ -713,30 +702,19 @@ public:
   bool await_ready() const noexcept { return false; }
 
   template <typename Promise>
-  void await_suspend(std::coroutine_handle<Promise> caller) {
-    auto *payload =
-        detail::pmr_new(detail::Payload<E>{.effect_value = std::move(effect_),
-                                           .caller = caller,
-                                           .result_ptr = &result_});
-
+  void await_suspend(std::coroutine_handle<Promise> caller) noexcept {
+    caller_ = caller;
     caller.promise().effect_tag = &detail::effect_tag_v<E>;
-    caller.promise().payload_ptr = payload;
-
-    for (auto *n = detail::stack_top; n; n = n->prev) {
-      if (n->effect_tag == &detail::effect_tag_v<E>) {
-        n->dispatch(n->handler_obj, payload);
-        return;
-      }
-    }
-    detail::pmr_delete(payload);
-    throw std::runtime_error("fx::perform -- no handler for this effect type");
+    caller.promise().payload_ptr = this; // points into coroutine frame
   }
 
   typename E::result_type await_resume() { return std::move(result_); }
 
-private:
+  // Public so ScopedHandler::dispatch and any static-dispatch helper
+  // can access them without friendship boilerplate.
   E effect_;
   typename E::result_type result_{};
+  std::coroutine_handle<> caller_{};
 };
 
 namespace detail {

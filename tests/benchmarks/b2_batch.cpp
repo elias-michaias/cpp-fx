@@ -2,8 +2,9 @@
 //
 // A single Fx coroutine that performs N effects amortises the one-time
 // coroutine-frame allocation across all N performs.  This benchmark isolates
-// the per-perform cost (Payload alloc + handler dispatch + resume) from the
-// per-coroutine cost measured in b1_dispatch.
+// the per-perform cost (handler dispatch + resume) from the
+// per-coroutine cost (frame alloc) measured in b1_dispatch.
+// Per-perform payload allocation is zero — effect state lives on the frame.
 //
 // Comparisons:
 //   1. Direct tight loop (baseline — no indirection)
@@ -44,7 +45,7 @@ int main() {
           ", reps=" + std::to_string(REPS) + ")");
   std::cout
       << "  Each iteration runs a loop of " << BATCH << " dispatches.\n"
-      << "  Fx: one coroutine frame per iteration, " << BATCH << " Payload allocs.\n\n";
+      << "  Fx: one coroutine frame per iteration; " << BATCH << " performs are zero-alloc.\n\n";
 
   BenchResult direct_r, stdfn_r, fx_r;
 
@@ -103,8 +104,8 @@ int main() {
             << std::setprecision(2) << per(fx_r) << " ns/call\n";
 
   std::cout
-      << "\nNote: the Fx overhead vs direct is mainly the Payload heap alloc.\n"
-      << "      Replacing the per-perform heap alloc with a pool would close\n"
-      << "      most of the gap.\n";
+      << "\nNote: the Fx overhead vs direct is the handler stack walk + resume\n"
+      << "      per perform, plus the one-time coroutine frame alloc amortised\n"
+      << "      across all " << BATCH << " performs.\n";
   return 0;
 }

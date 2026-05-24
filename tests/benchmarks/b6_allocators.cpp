@@ -1,19 +1,19 @@
-// b6_allocators.cpp — per-perform Payload allocation strategies
+// b6_allocators.cpp — coroutine frame allocation strategies
 //
-// The two hot allocation sites in the library are:
+// Per-perform Payload allocation no longer exists: perform() stores all
+// per-effect state inline in PerformAwaitable on the coroutine frame.
+//
+// The only remaining hot allocation site is:
 //
 //   • Coroutine frame  — one allocation when the Fx<T> is constructed.
-//   • Payload<E>       — one allocation per fx::perform() call.
 //
-// Both are redirected through the active ScopedAllocator (if any).
-// This benchmark compares five strategies for BATCH performs per coroutine,
-// run REPS times:
+// This benchmark compares frame-allocation strategies:
 //
 //  1. Default (global operator new / delete)
-//  2. PMR monotonic_buffer_resource backed by a heap buffer
-//  3. PMR monotonic_buffer_resource backed by a static (non-heap) buffer
+//  2. PMR monotonic_buffer_resource backed by a heap buffer (reset per iter)
+//  3. PMR monotonic_buffer_resource backed by a static buffer (reset per iter)
 //  4. PMR unsynchronized_pool_resource (steady-state block reuse)
-//  5. Hand-rolled O(1) free-list slab — no virtual dispatch overhead
+//  5. Hand-rolled O(1) free-list slab
 
 #include "../../effects.hpp"
 #include "bench.hpp"
@@ -29,28 +29,21 @@ struct Tick : fx::Effect<Tick> {
   using result_type = int;
 };
 
-// ── Payload / frame size constants ───────────────────────────────────────────
-
-// Payload<Tick> = { Tick (1B + padding) + std::function<void(int)> (32B) }
-// Typically 40 bytes on x86-64 / libstdc++.  We round up to max_align_t.
-static constexpr std::size_t kPayloadSize = sizeof(fx::detail::Payload<Tick>);
-
-static constexpr std::size_t kBlockSize =
-    (kPayloadSize + alignof(std::max_align_t) - 1) &
-    ~(alignof(std::max_align_t) - 1);
+// ── Frame size constants ─────────────────────────────────────────────────────
 
 // Rough upper bound on a coroutine frame for Tick::Fx<long long>.
 // Actual size is compiler-dependent (~200-400 bytes); 512 is safe.
 static constexpr std::size_t kFrameEst = 512;
+
+// One extra pointer stored after the frame by PromiseBase::operator new.
+static constexpr std::size_t kFrameSlot = kFrameEst + sizeof(void *);
 
 // ── Hand-rolled free-list slab ───────────────────────────────────────────────
 //
 // Slab of Capacity fixed-size blocks.  Each free block holds a pointer to the
 // next free block (intrusive list).  Alloc and free are O(1).
 //
-// Large allocations (e.g., coroutine frames which are bigger than a Payload)
-// fall through to a configurable fallback resource.  The dealloc side checks
-// whether the pointer lives inside our storage range to dispatch correctly.
+// Large allocations fall through to a configurable fallback resource.
 
 template <std::size_t BlockSize, std::size_t Capacity>
 class FreeListSlab : public std::pmr::memory_resource {
@@ -119,17 +112,14 @@ private:
 static constexpr int BATCH = 5'000; // performs per coroutine
 static constexpr int REPS = 2'000;  // coroutine invocations
 
-// Arena must hold BATCH payloads + one frame per invocation.
-// We round up generously and keep a single large buffer.
-static constexpr std::size_t kArena =
-    BATCH * (kBlockSize + 8 /*ptr overhead in PromiseBase::operator new*/) +
-    kFrameEst + 65536;
+// Arena must hold one frame per invocation (performs are zero-alloc now).
+static constexpr std::size_t kArena = kFrameSlot + 65536;
 
 // ── Handler ──────────────────────────────────────────────────────────────────
 
-struct CountHandler {
+struct CountHandler : Tick::Handler<CountHandler> {
   int n = 0;
-  void operator()(Tick, std::function<void(int)> resume) { resume(n++); }
+  void operator()(Tick, auto resume) { resume(n++); }
 };
 
 // ── Inner coroutine ──────────────────────────────────────────────────────────
@@ -145,20 +135,20 @@ static auto make_batch_coro() -> Tick::Fx<long long> {
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 int main() {
-  section("b6 — Allocator strategies");
-  std::cout << "  Payload<Tick> size : " << kPayloadSize << " bytes\n";
-  std::cout << "  Block size (slab)  : " << kBlockSize << " bytes\n";
+  section("b6 — Coroutine frame allocator strategies");
+  std::cout << "  Frame estimate     : " << kFrameEst << " bytes\n";
   std::cout << "  Arena budget       : " << kArena / 1024 << " KiB\n";
-  std::cout << "  Batch              : " << BATCH << " performs × " << REPS
-            << " coroutines\n";
+  std::cout << "  Batch              : " << BATCH << " performs (zero-alloc) × "
+            << REPS << " coroutines\n";
+  std::cout << "  Note: per-perform payload allocation eliminated;\n"
+            << "        only coroutine frame allocation is benchmarked.\n";
 
   section("Batch cost (per-coroutine ns)");
 
   // ── 1. Default (global new/delete) ──────────────────────────────────────
   print_result(bench("1. Default new/delete", REPS, [&] {
     CountHandler h;
-    auto guard = fx::handler<Tick>(h);
-    do_not_optimize(make_batch_coro().run(guard));
+    do_not_optimize(make_batch_coro().run(h));
   }));
 
   // ── 2. PMR monotonic — heap buffer, reset each iter ─────────────────────
@@ -169,28 +159,23 @@ int main() {
           buf.data(), buf.size(), std::pmr::null_memory_resource()};
       fx::ScopedAllocator alloc{&arena};
       CountHandler h;
-      auto guard = fx::handler<Tick>(h);
-      do_not_optimize(make_batch_coro().run(guard));
+      do_not_optimize(make_batch_coro().run(h));
     }));
   }
 
   // ── 3. PMR monotonic — static (non-heap) buffer, reset each iter ────────
   {
-    // Declared static to avoid blowing the call stack.
     static std::array<std::byte, kArena> sbuf;
     print_result(bench("3. Monotonic (static buf, reset/iter)", REPS, [&] {
       std::pmr::monotonic_buffer_resource arena{
           sbuf.data(), sbuf.size(), std::pmr::null_memory_resource()};
       fx::ScopedAllocator alloc{&arena};
       CountHandler h;
-      auto guard = fx::handler<Tick>(h);
-      do_not_optimize(make_batch_coro().run(guard));
+      do_not_optimize(make_batch_coro().run(h));
     }));
   }
 
   // ── 4. PMR pool — steady-state reuse ────────────────────────────────────
-  // Pool and ScopedAllocator are created once; payloads are freed back into
-  // the pool each iteration, so the same blocks cycle across all REPS.
   {
     std::vector<std::byte> pbuf(kArena);
     std::pmr::monotonic_buffer_resource backing{
@@ -200,29 +185,27 @@ int main() {
 
     print_result(bench("4. PMR pool (steady-state)", REPS, [&] {
       CountHandler h;
-      auto guard = fx::handler<Tick>(h);
-      do_not_optimize(make_batch_coro().run(guard));
+      do_not_optimize(make_batch_coro().run(h));
     }));
   }
 
   // ── 5. Hand-rolled free-list slab ────────────────────────────────────────
-  // One slab that can hold BATCH+2 blocks (BATCH payloads + a frame slot).
-  // reset() is called before each iteration so all slots are available.
   {
-    static FreeListSlab<kBlockSize, BATCH + 4> slab;
+    static FreeListSlab<kFrameSlot, 4> slab;
     fx::ScopedAllocator alloc{&slab};
 
     print_result(bench("5. Free-list slab (O(1), no vdispatch)", REPS, [&] {
       slab.reset();
       CountHandler h;
-      auto guard = fx::handler<Tick>(h);
-      do_not_optimize(make_batch_coro().run(guard));
+      do_not_optimize(make_batch_coro().run(h));
     }));
   }
 
   // ── Per-perform breakdown ────────────────────────────────────────────────
   section("Per-perform cost (÷ " + std::to_string(BATCH) + ")");
-  std::cout << "  (re-run above / " << BATCH << " to get ns/perform)\n";
+  std::cout << "  Per-perform payload alloc: ZERO (stored in coroutine frame)\n";
+  std::cout << "  (Divide per-coroutine ns above by " << BATCH
+            << " for residual per-perform overhead.)\n";
 
   // ── Single-perform worst case ────────────────────────────────────────────
   section("Single-perform coroutine (worst-case frame amortisation)");
@@ -234,8 +217,7 @@ int main() {
   // 1s. Default
   print_result(bench("1s. Default", SP_REPS, [&] {
     CountHandler h;
-    auto guard = fx::handler<Tick>(h);
-    do_not_optimize(sp_make().run(guard));
+    do_not_optimize(sp_make().run(h));
   }));
 
   // 4s. PMR pool (steady-state)
@@ -247,19 +229,18 @@ int main() {
     fx::ScopedAllocator a2{&pool2};
     print_result(bench("4s. PMR pool", SP_REPS, [&] {
       CountHandler h;
-      auto guard = fx::handler<Tick>(h);
-      do_not_optimize(sp_make().run(guard));
+      do_not_optimize(sp_make().run(h));
     }));
   }
 
-  // 5s. Free-list slab (8 slots — one frame + one payload at a time)
+  // 5s. Free-list slab (2 slots — one frame at a time)
   {
-    static FreeListSlab<kBlockSize, 8> mini_slab;
+    static FreeListSlab<kFrameSlot, 2> mini_slab;
     fx::ScopedAllocator a5{&mini_slab};
     print_result(bench("5s. Free-list slab", SP_REPS, [&] {
+      mini_slab.reset();
       CountHandler h;
-      auto guard = fx::handler<Tick>(h);
-      do_not_optimize(sp_make().run(guard));
+      do_not_optimize(sp_make().run(h));
     }));
   }
 

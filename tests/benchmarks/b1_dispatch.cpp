@@ -8,8 +8,9 @@
 //   3. Virtual dispatch (abstract class)         — classic OOP indirection
 //   4. fx::perform (algebraic effect)            — our library
 //
-// fx::perform involves: coroutine frame allocation, one heap Payload
-// allocation, a linear handler stack walk, and a coroutine resume.
+// fx::perform involves: coroutine frame allocation (one per Fx construction),
+// a linear handler stack walk, and a coroutine resume.  Per-perform payload
+// allocation is zero — effect state lives inline on the coroutine frame.
 // Each iteration creates a fresh Fx<> (worst case — includes frame alloc).
 //
 // Expected: perform() is slower than a raw call but in the same order of
@@ -47,8 +48,7 @@ int main() {
   section("b1: per-invocation dispatch overhead  (N = " + std::to_string(N) +
           " iterations)");
   std::cout << "  Each iteration dispatches once and returns an int.\n"
-            << "  Fx includes coroutine-frame + Payload heap alloc per "
-               "iteration.\n\n";
+            << "  Fx: one coroutine-frame alloc per iteration; zero per-perform allocs.\n\n";
 
   // 1. Direct call
   {
@@ -91,8 +91,7 @@ int main() {
   }
 
   std::cout
-      << "\nNote: perform() overhead is dominated by heap allocs (frame + "
-         "Payload).\n"
-      << "      Use b2_batch to see amortised cost across many performs.\n";
+      << "\nNote: perform() overhead is dominated by the coroutine frame alloc.\n"
+      << "      Use b2_batch to see the amortised cost across many performs.\n";
   return 0;
 }
