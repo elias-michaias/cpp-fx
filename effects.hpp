@@ -26,6 +26,7 @@
 //  handler<E>(lambda)       -- wrap a lambda as a single-effect TypedHandler
 //  handler<Row>(l1, l2, ...) -- build an inline CompositeHandler for a Row
 //  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is
+#include <any>
 #include <coroutine>
 #include <exception>
 #include <functional>
@@ -105,10 +106,20 @@ auto handler(F &&fn) {
 
 namespace detail {
 
+// Non-templated base for the abort slot in every promise.
+// Stored by pointer in PerformAwaitable so ScopedHandler::dispatch can
+// signal abort without knowing T or Es.
+struct PromiseAbortBase {
+  bool        aborted     = false;
+  void       *abort_owner = nullptr; // address of the handler that aborted
+  std::any    abort_value;           // typed abort value, set by aborting handler
+};
+
 struct HandlerNode {
   const void *effect_tag = nullptr;
-  void *handler_obj = nullptr;
-  void (*dispatch)(void *handler_obj, void *payload) = nullptr;
+  void *handler_obj = nullptr;      // abort-owner ID (= &node for TypedHandler, or group_id for composite)
+  void *real_handler_ptr = nullptr; // actual handler object pointer (used by dispatch lambda)
+  void (*dispatch)(void *node_self, void *payload) = nullptr;
   HandlerNode *prev = nullptr;
 };
 
@@ -126,7 +137,7 @@ template <Effectful E> inline constexpr char effect_tag_v = 0;
 inline void dispatch_effect(const void *tag, void *payload_ptr) {
   for (auto *n = stack_top; n; n = n->prev) {
     if (n->effect_tag == tag) {
-      n->dispatch(n->handler_obj, payload_ptr);
+      n->dispatch(reinterpret_cast<void *>(n), payload_ptr);
       return;
     }
   }
@@ -241,7 +252,37 @@ using flatten_effects_t = typename flatten_effects<Ts...>::type;
 // Build a BasicRow (defined below) from a type_list of Effectful types.
 template <typename List> struct row_from_list; // defined after BasicRow
 
+// --- Return clause type traits ----------------------------------------------
 
+// Does H have a on_return(InnerR) method?
+template <typename H, typename InnerR>
+concept HasReturnClause =
+    requires(std::remove_cvref_t<H> &h, InnerR v) { h.on_return(std::move(v)); };
+
+// What type does H::on_return(InnerR) produce?
+template <typename H, typename InnerR>
+using on_return_t =
+    decltype(std::declval<std::remove_cvref_t<H> &>().on_return(std::declval<InnerR>()));
+
+// Fold right over handler list: last handler (innermost) wraps T first.
+// Handlers without a on_return are identity transforms.
+// Uses a helper struct to avoid eager instantiation of on_return_t
+// in the false branch (std::conditional_t instantiates both).
+template <typename H, typename InnerR, bool = HasReturnClause<H, InnerR>>
+struct compose_one { using type = InnerR; };
+template <typename H, typename InnerR>
+struct compose_one<H, InnerR, true> { using type = on_return_t<H, InnerR>; };
+
+template <typename T, typename... Hs> struct composed_return {
+  using type = T;
+};
+template <typename T, typename H, typename... Hs>
+struct composed_return<T, H, Hs...> {
+  using inner = typename composed_return<T, Hs...>::type;
+  using type  = typename compose_one<H, inner>::type;
+};
+template <typename T, typename... Hs>
+using composed_return_t = typename composed_return<T, Hs...>::type;
 
 } // namespace detail
 
@@ -283,7 +324,7 @@ template <typename F> struct FxAwaitable {
 
 // Shared promise_type base for Fx<T> and Fx<void>.
 // Holds the coroutine state and all await_transform overloads in one place.
-template <typename... Es> struct PromiseBase {
+template <typename... Es> struct PromiseBase : PromiseAbortBase {
   std::exception_ptr exception;
   const void *effect_tag = nullptr;
   void *payload_ptr = nullptr;
@@ -383,13 +424,28 @@ struct ScopedHandler {
   detail::HandlerNode node;
   detail::HandlerNode *saved;
 
-  explicit ScopedHandler(H &h) {
-    node.effect_tag = &detail::effect_tag_v<E>;
-    node.handler_obj = static_cast<void *>(&h);
-    node.dispatch = [](void *hobj, void *raw) {
-      auto &hh = *reinterpret_cast<std::remove_reference_t<H> *>(hobj);
+  explicit ScopedHandler(H &h, void *group_id = nullptr) {
+    node.effect_tag      = &detail::effect_tag_v<E>;
+    node.real_handler_ptr = static_cast<void *>(&h);
+    // handler_obj doubles as the abort-owner ID:
+    //   • TypedHandler path  → group_id==nullptr → use &node (unique per instance)
+    //   • CompositeHandler path → group_id supplied by run_push_composite → shared token
+    node.handler_obj = group_id ? group_id : static_cast<void *>(&node);
+    node.dispatch = [](void *node_self, void *raw) {
+      // node_self == the HandlerNode* itself (passed by dispatch_effect)
+      auto *n  = reinterpret_cast<detail::HandlerNode *>(node_self);
+      auto &hh = *reinterpret_cast<std::remove_reference_t<H> *>(n->real_handler_ptr);
       auto *pa = reinterpret_cast<PerformAwaitable<E> *>(raw);
-      hh(pa->effect_, Resume<E>{pa});
+      using Ret = decltype(hh(pa->effect_, Resume<E>{pa}));
+      if constexpr (std::is_void_v<Ret>) {
+        hh(pa->effect_, Resume<E>{pa}); // calls r() → resumes coroutine
+      } else {
+        // Handler returned non-void: abort path. Must NOT call r().
+        auto val = hh(pa->effect_, Resume<E>{pa});
+        pa->abort_base_->aborted     = true;
+        pa->abort_base_->abort_owner = n->handler_obj; // = &node or group_id
+        pa->abort_base_->abort_value = std::any(std::move(val));
+      }
     };
     saved = detail::stack_top;
     node.prev = saved;
@@ -465,35 +521,94 @@ private:
   using Impl = std::variant<OwnedHandle, Fn>;
   Impl impl_;
 
+  // Access the non-templated abort slot in the promise (null for Fn variant).
+  detail::PromiseAbortBase *get_abort_base() noexcept {
+    if (auto *oh = std::get_if<OwnedHandle>(&impl_))
+      return &oh->h.promise();
+    return nullptr;
+  }
+
   // Base: all handlers pushed; drive the coroutine.
-  T run_push() { return _run(); }
+  // Returns nullopt if a handler aborted (coroutine left suspended + destroyed).
+  std::optional<T> run_push() {
+    if (auto *fn = std::get_if<Fn>(&impl_))
+      return (*fn)();
+    auto &h = std::get<OwnedHandle>(impl_).h;
+    h.resume();
+    while (!h.done()) {
+      auto &p = h.promise();
+      detail::dispatch_effect(p.effect_tag, p.payload_ptr);
+      if (h.promise().aborted) return std::nullopt;
+    }
+    auto &p = h.promise();
+    if (p.exception) std::rethrow_exception(p.exception);
+    return std::move(*p.result);
+  }
 
   // Single TypedHandler: push onto thread-local stack, recurse.
   template <TypedHandler H, typename... Rest>
     requires(!CompositeHandler<std::remove_cvref_t<H>>)
-  T run_push(H &h, Rest &...rest) {
-    using Hb = std::remove_cvref_t<H>;
+  auto run_push(H &h, Rest &...rest)
+      -> std::optional<detail::composed_return_t<T, H, Rest...>> {
+    using Hb     = std::remove_cvref_t<H>;
+    using InnerR = detail::composed_return_t<T, Rest...>;
+    using R      = detail::composed_return_t<T, H, Rest...>;
     ScopedHandler<typename Hb::effect_type, Hb> guard{h};
-    return run_push(rest...);
+    auto inner = run_push(rest...);
+    auto *ab   = get_abort_base();
+    // Did THIS handler abort? Compare against the node's own address (unique
+    // even when the handler object is an empty type and aliases another's addr).
+    if (ab && ab->aborted && ab->abort_owner == static_cast<void *>(&guard.node)) {
+      ab->aborted = false;
+      return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+    }
+    if (!inner) return std::nullopt; // abort still in flight for outer level
+    // Normal path — apply return clause if declared.
+    if constexpr (detail::HasReturnClause<Hb, InnerR>)
+      return std::optional<R>{h.on_return(std::move(*inner))};
+    else
+      return inner; // R == InnerR, move the optional as-is
+  }
+  template <CompositeHandler H, typename... Rest>
+  auto run_push(H &h, Rest &...rest)
+      -> std::optional<detail::composed_return_t<T, H, Rest...>> {
+    using Hb     = std::remove_cvref_t<H>;
+    using InnerR = detail::composed_return_t<T, Rest...>;
+    using R      = detail::composed_return_t<T, Hb, Rest...>;
+    // Use a stack token as the group-abort-owner ID so every ScopedHandler
+    // installed for this composite level shares the same unique identifier.
+    char        group_token{};
+    void *const group_id = &group_token;
+    auto inner   = run_push_composite(h, group_id,
+                     typename Hb::effect_types{}, rest...);
+    auto *ab     = get_abort_base();
+    if (ab && ab->aborted && ab->abort_owner == group_id) {
+      ab->aborted = false;
+      return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+    }
+    if (!inner) return std::nullopt;
+    if constexpr (detail::HasReturnClause<Hb, InnerR>)
+      return std::optional<R>{h.on_return(std::move(*inner))};
+    else
+      return inner; // R == InnerR, move the optional as-is
   }
 
-  // CompositeHandler: push one ScopedHandler per declared effect.
-  template <CompositeHandler H, typename... Rest>
-  T run_push(H &h, Rest &...rest) {
-    return run_push_composite(h,
-        typename std::remove_cvref_t<H>::effect_types{}, rest...);
+  // Helper: pushes one ScopedHandler per effect in the composite's type_list,
+  // then falls through to run_push(rest...) for the remaining handlers.
+  // Both overloads return the same type so the recursive case can deduce it.
+  template <typename H, typename... Rest>
+  auto run_push_composite([[maybe_unused]] H &h, void * /*group_id*/,
+                          detail::type_list<>, Rest &...rest)
+      -> std::optional<detail::composed_return_t<T, Rest...>> {
+    return run_push(rest...);
   }
 
   template <typename H, Effectful First, Effectful... Rem, typename... Rest>
-  T run_push_composite(H &h, detail::type_list<First, Rem...>, Rest &...rest) {
-    ScopedHandler<First, H> guard{h};
-    return run_push_composite(h, detail::type_list<Rem...>{}, rest...);
-  }
-
-  template <typename H, typename... Rest>
-  T run_push_composite([[maybe_unused]] H &h, detail::type_list<>,
-                       Rest &...rest) {
-    return run_push(rest...);
+  auto run_push_composite(H &h, void *group_id,
+                          detail::type_list<First, Rem...>, Rest &...rest)
+      -> std::optional<detail::composed_return_t<T, Rest...>> {
+    ScopedHandler<First, H> guard{h, group_id};
+    return run_push_composite(h, group_id, detail::type_list<Rem...>{}, rest...);
   }
 
 public:
@@ -503,42 +618,40 @@ public:
   Fx(const Fx &) = delete;
   Fx &operator=(const Fx &) = delete;
 
-/// Execute with handler types as template parameters (default-constructs
+  /// Execute with handler types as template parameters (default-constructs
   /// each handler).  Compile error if any declared effect is unhandled.
-  ///
-  ///   comp.run<MyAsk, MyLog>();
   template <typename... Hs>
     requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
           && (std::default_initializable<Hs> && ...)
-  T run() {
+  auto run() {
     std::tuple<Hs...> locals{};
-    return std::apply(
-        [this](auto &...hs) -> T { return run_push(hs...); }, locals);
+    return *std::apply(
+        [this](auto &...hs) { return run_push(hs...); }, locals);
   }
 
   /// @cond — deleted fallback for run<Hs...>() when coverage is incomplete.
   template <typename... Hs>
     requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
-  T run() = delete;
+  auto run() = delete;
   /// @endcond
 
   /// Execute with handler instances.  Compile error if any effect is unhandled.
-  ///
-  ///   comp.run(MyAsk{...}, MyLog{...});
   template <typename... Hs>
     requires detail::all_handled_v<detail::type_list<Es...>, Hs...>
-  T run(Hs &&...hs) {
+  auto run(Hs &&...hs) {
     auto locals = std::make_tuple(std::forward<Hs>(hs)...);
-    return std::apply(
-        [this](auto &...lhs) -> T { return run_push(lhs...); }, locals);
+    return *std::apply(
+        [this](auto &...lhs) { return run_push(lhs...); }, locals);
   }
 
   /// @cond — deleted fallback; triggers IDE squiggle when a handler is missing.
   template <typename... Hs>
     requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
-  T run(Hs &&...) = delete;
+  auto run(Hs &&...) = delete;
   /// @endcond
 
+  // Used by FxAwaitable (co_await inner_fx) and handle<E>().
+  // Runs without abort support — abort handlers must be outermost.
   T _run() {
     if (auto *fn = std::get_if<Fn>(&impl_))
       return (*fn)();
@@ -654,6 +767,7 @@ public:
     while (!h.done()) {
       auto &p = h.promise();
       detail::dispatch_effect(p.effect_tag, p.payload_ptr);
+      if (h.promise().aborted) return;
     }
     if (h.promise().exception)
       std::rethrow_exception(h.promise().exception);
@@ -708,8 +822,9 @@ public:
 
   template <typename Promise>
   void await_suspend(std::coroutine_handle<Promise> caller) noexcept {
-    caller_ = caller;
-    caller.promise().effect_tag = &detail::effect_tag_v<E>;
+    caller_      = caller;
+    abort_base_  = &caller.promise(); // Promise inherits PromiseAbortBase
+    caller.promise().effect_tag  = &detail::effect_tag_v<E>;
     caller.promise().payload_ptr = this; // points into coroutine frame
   }
 
@@ -720,6 +835,7 @@ public:
   E effect_;
   typename E::result_type result_{};
   std::coroutine_handle<> caller_{};
+  detail::PromiseAbortBase *abort_base_ = nullptr; // set in await_suspend
 };
 
 // Out-of-line body for Resume<E>::operator() — needs PerformAwaitable complete.

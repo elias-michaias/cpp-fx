@@ -56,7 +56,7 @@ struct StateHandler : State<S>::Handler<StateHandler<S>> {
 } // namespace detail
 
 template <typename S>
-detail::StateHandler<S> state_handler(S &s) {
+auto state_handler(S &s) -> detail::StateHandler<S> {
     return {.ptr = &s};
 }
 

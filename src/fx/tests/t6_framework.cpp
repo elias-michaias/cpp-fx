@@ -81,7 +81,7 @@ using namespace fx::raise;
 static auto safe_div(int a, int b) -> Raise<std::string>::Fx<int> {
     if (b == 0) {
         perform(Raise<std::string>{.error = "div/0"});
-        std::unreachable(); // raise_handler escapes via exception; never reaches here
+        std::unreachable(); // handler aborts without calling r(); coroutine never resumes
     }
     co_return a / b;
 }
@@ -216,7 +216,7 @@ static auto pipeline(int n) -> Row::Fx<int> {
         int s = perform(Get<int>{});
         if (s > cfg.limit) {
             perform(Raise<std::string>{.error = "limit exceeded"});
-            std::unreachable();
+            std::unreachable(); // handler aborts; coroutine never resumes
         }
         perform(debug("tick"));
         perform(Put<int>{.value = s + 1});
@@ -254,6 +254,42 @@ static void run() {
 } // namespace test_composed
 
 // ============================================================================
+// Return clause — handler returns non-void to abort; on_return wraps value
+// ============================================================================
+
+namespace test_on_return {
+
+struct Fail : fx::Effect<Fail> {
+    std::string msg;
+    using result_type = int; // never used on abort path
+};
+
+auto safe_div(int a, int b) -> Fail::Fx<int> {
+    if (b == 0) perform(Fail{.msg = "div by zero"});
+    co_return a / b;
+}
+
+struct FailToOpt : Fail::Handler<FailToOpt> {
+    // Normal path: wrap the computation result in optional.
+    auto on_return(int val) -> std::optional<int> { return val; }
+    // Abort path: return nullopt without calling r().
+    auto operator()(Fail, auto /*r*/) -> std::optional<int> { return std::nullopt; }
+};
+
+void run() {
+    auto ok = safe_div(10, 2).run(FailToOpt{});
+    static_assert(std::is_same_v<decltype(ok), std::optional<int>>);
+    assert(ok.has_value() && *ok == 5);
+    PASS("on_return: normal path wraps value via on_return");
+
+    auto err = safe_div(1, 0).run(FailToOpt{});
+    assert(!err.has_value());
+    PASS("on_return: abort path returns nullopt without calling r()");
+}
+
+} // namespace test_on_return
+
+// ============================================================================
 
 int main() {
     std::cout << "=== t6: framework micro-libraries ===\n\n";
@@ -265,6 +301,7 @@ int main() {
     std::cout << "[chan]\n";     test_chan::run();
     std::cout << "[match]\n";   test_match::run();
     std::cout << "[composed]\n"; test_composed::run();
+    std::cout << "[on_return]\n"; test_on_return::run();
 
     std::cout << "\nAll tests passed.\n";
 }
