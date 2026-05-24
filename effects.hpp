@@ -6,8 +6,9 @@
 //  Effect<Self>     -- CRTP base; gives Self::Fx<R> and Self::Handler<Derived>
 //                      Use: struct MyEff : Effect<MyEff> { using result_type =
 //                      T; };
-//  Handler H        -- callable  (E, std::function<void(E::result_type)>) ->
-//  void
+//  Handler H        -- callable  (E, fx::Resume<E>) -> void
+//                      Resume<E> is a lightweight resume token; r(value) resumes
+//                      the suspended perform.  Use `auto r` in the signature.
 //
 //  E::Fx<T>                 -- coroutine return type for a single effect E
 //  Row<E1,E2>::Fx<T>        -- coroutine return type for multiple effects
@@ -47,14 +48,25 @@ namespace fx {
 template <typename E>
 concept Effectful = requires { typename E::result_type; };
 
-/// Satisfied when H can be called as `h(e, resume)` where `e` is of type
-/// `E` and `resume` is `std::function<void(E::result_type)>`.
-/// The `requires` expression shows the expected call shape in diagnostics.
+// Forward-declare PerformAwaitable so Resume<E> can hold a pointer to it.
+// Full definition is in the perform() section below.
+template <Effectful E> class PerformAwaitable;
+
+/// Lightweight resume token passed to handlers instead of std::function.
+/// Stores a single pointer into the coroutine frame — no heap allocation,
+/// no type erasure, no virtual dispatch.  Call r(value) to resume.
+template <Effectful E>
+struct Resume {
+  PerformAwaitable<E> *pa;
+  void operator()(typename E::result_type v) const;
+};
+
+/// Satisfied when H can be called as `h(e, r)` where `e : E` and `r : Resume<E>`.
+/// Use `auto r` in the handler signature — Resume<E> is not std::function.
 template <typename H, typename E>
 concept HandlerFor =
     Effectful<E> &&
-    requires(std::remove_cvref_t<H> &h, E e,
-             std::function<void(typename E::result_type)> r) { h(e, r); };
+    requires(std::remove_cvref_t<H> &h, E e, Resume<E> r) { h(e, r); };
 
 /// Satisfied by handler objects that advertise their target effect via
 /// an `effect_type` alias (produced by `Effect::Handler<Derived>` or
@@ -76,9 +88,7 @@ template <Effectful E, typename F>
 struct LambdaHandler {
   using effect_type = E;
   F fn;
-  void operator()(E e, std::function<void(typename E::result_type)> resume) {
-    fn(std::move(e), std::move(resume));
-  }
+  void operator()(E e, auto r) { fn(std::move(e), std::move(r)); }
 };
 
 /// Wraps `fn` in a `LambdaHandler<E>` so it can be passed to `.run()`.
@@ -247,9 +257,9 @@ concept CompositeHandler =
     detail::all_effects_handled_v<
         std::remove_cvref_t<H>, typename std::remove_cvref_t<H>::effect_types>;
 
-// Forward-declare Fx and PerformAwaitable so promise_type can reference both.
+// Forward-declare Fx so promise_type can reference it.
+// PerformAwaitable is already forward-declared above (needed by Resume<E>).
 template <typename T, Effectful... Es> class Fx;
-template <Effectful E> class PerformAwaitable;
 
 namespace detail {
 
@@ -377,14 +387,9 @@ struct ScopedHandler {
     node.effect_tag = &detail::effect_tag_v<E>;
     node.handler_obj = static_cast<void *>(&h);
     node.dispatch = [](void *hobj, void *raw) {
-      using R = typename E::result_type;
       auto &hh = *reinterpret_cast<std::remove_reference_t<H> *>(hobj);
       auto *pa = reinterpret_cast<PerformAwaitable<E> *>(raw);
-      std::function<void(R)> resume = [pa](R v) {
-        pa->result_ = std::move(v);
-        pa->caller_.resume();
-      };
-      hh(pa->effect_, std::move(resume));
+      hh(pa->effect_, Resume<E>{pa});
     };
     saved = detail::stack_top;
     node.prev = saved;
@@ -717,6 +722,13 @@ public:
   std::coroutine_handle<> caller_{};
 };
 
+// Out-of-line body for Resume<E>::operator() — needs PerformAwaitable complete.
+template <Effectful E>
+void Resume<E>::operator()(typename E::result_type v) const {
+  pa->result_ = std::move(v);
+  pa->caller_.resume();
+}
+
 namespace detail {
 template <Effectful E> auto perform_impl(E e) {
   return PerformAwaitable<E>{std::move(e)};
@@ -822,7 +834,7 @@ template <RowType R, typename... Lambdas> struct CompositeLambdaHandler {
   std::tuple<Lambdas...> fns;
 
   template <Effectful E>
-  void operator()(E e, std::function<void(typename E::result_type)> r) {
+  void operator()(E e, auto r) {
     std::apply(
         [&](auto &...fn) {
           (... || [&]() -> bool {
