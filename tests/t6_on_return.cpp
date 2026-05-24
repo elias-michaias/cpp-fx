@@ -293,8 +293,8 @@ struct AnnotatedAsk : Ask::Handler<AnnotatedAsk> {
   // T is deduced as `int` here (the computation returns int).
   // The handler never mentions int — it works for any non-void T.
   template <typename T>
-  auto handle(Ask e, fx::TypedResume<Ask, T> k) -> std::string {
-    T len = k.resume_and_get("hello");   // T deduced, no explicit <int>
+  auto handle(Ask e, fx::Continuation<Ask, T> k) -> std::string {
+    T len = k.resume("hello");   // T deduced, no explicit <int>
     return "Q=[" + e.prompt + "] A_len=" + std::to_string(len);
   }
 };
