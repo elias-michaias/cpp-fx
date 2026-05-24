@@ -43,7 +43,7 @@ using All = Row<IO, Fail>;
 // ---- Common handler structs ------------------------------------------------
 
 struct StdoutLog : Log::Handler<StdoutLog> {
-  void  handle(Log e, auto r) {
+  void handle(Log e, auto r) {
     std::cout << "[log] " << e.message << "\n";
     r({});
   }
@@ -51,7 +51,7 @@ struct StdoutLog : Log::Handler<StdoutLog> {
 VALIDATE_HANDLER(StdoutLog);
 
 struct WarnFail : Fail::Handler<WarnFail> {
-  void  handle(Fail e, auto r) {
+  void handle(Fail e, auto r) {
     std::cout << "[fail] " << e.reason << " -> -1\n";
     r(-1);
   }
