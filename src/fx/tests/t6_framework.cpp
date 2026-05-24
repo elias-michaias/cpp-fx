@@ -273,7 +273,7 @@ struct FailToOpt : Fail::Handler<FailToOpt> {
     // Normal path: wrap the computation result in optional.
     auto on_return(int val) -> std::optional<int> { return val; }
     // Abort path: return nullopt without calling r().
-    auto operator()(Fail, auto /*r*/) -> std::optional<int> { return std::nullopt; }
+    auto  handle(Fail, auto /*r*/) -> std::optional<int> { return std::nullopt; }
 };
 
 void run() {

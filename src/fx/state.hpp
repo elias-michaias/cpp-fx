@@ -49,8 +49,8 @@ namespace detail {
 template <typename S>
 struct StateHandler : State<S>::Handler<StateHandler<S>> {
     S *ptr;
-    void operator()(Get<S>,    auto r) const { r(*ptr); }
-    void operator()(Put<S> p,  auto r)       { *ptr = std::move(p.value); r({}); }
+    void  handle(Get<S>,    auto r) const { r(*ptr); }
+    void  handle(Put<S> p,  auto r)       { *ptr = std::move(p.value); r({}); }
 };
 
 } // namespace detail

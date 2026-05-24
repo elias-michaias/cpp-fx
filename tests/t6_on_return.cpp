@@ -60,21 +60,21 @@ static auto ask_log_div(int a, int b) -> Row<Ask, Log, Fail>::Fx<int> {
 
 // Handles Fail by resuming with 0; on_return converts int → string.
 struct IntToStr : Fail::Handler<IntToStr> {
-  void operator()(Fail, auto r) { r(0); }
+  void handle(Fail, auto r) { r(0); }
   auto on_return(auto v) -> std::string { return std::to_string(v); }
 };
 VALIDATE_HANDLER(IntToStr);
 
 // Dual-mode: abort (→ nullopt) on Fail; on_return wraps success int → optional<int>.
 struct FailToOpt : Fail::Handler<FailToOpt> {
-  auto operator()(Fail, auto) -> std::optional<int> { return std::nullopt; }
+  auto handle(Fail, auto) -> std::optional<int> { return std::nullopt; }
   auto on_return(auto v) -> std::optional<int> { return v; }
 };
 VALIDATE_HANDLER(FailToOpt);
 
 // Abort on Fail with reason; on_return wraps success → expected<int, string>.
 struct FailToExp : Fail::Handler<FailToExp> {
-  auto operator()(Fail f, auto) -> std::expected<int, std::string> {
+  auto handle(Fail f, auto) -> std::expected<int, std::string> {
     return std::unexpected(f.reason);
   }
   auto on_return(int v) -> std::expected<int, std::string> { return v; }
@@ -87,7 +87,7 @@ struct Tagged {
   bool ok;
 };
 struct FailToTagged : Fail::Handler<FailToTagged> {
-  auto operator()(Fail, auto) -> Tagged { return {-1, false}; }
+  auto handle(Fail, auto) -> Tagged { return {-1, false}; }
   auto on_return(int v) -> Tagged { return {v, true}; }
 };
 VALIDATE_HANDLER(FailToTagged);
@@ -96,14 +96,14 @@ VALIDATE_HANDLER(FailToTagged);
 template <typename T>
 struct LogCount : Log::Handler<LogCount<T>> {
   int count = 0;
-  void operator()(Log, auto r) { ++count; r({}); }
+  void handle(Log, auto r) { ++count; r({}); }
   auto on_return(T v) -> std::pair<T, int> { return {std::move(v), count}; }
 };
 
 // Counts Log messages but has no on_return — purely side-effectful.
 struct LogSilent : Log::Handler<LogSilent> {
   int count = 0;
-  void operator()(Log, auto r) { ++count; r({}); }
+  void handle(Log, auto r) { ++count; r({}); }
 };
 VALIDATE_HANDLER(LogSilent);
 
@@ -111,14 +111,14 @@ VALIDATE_HANDLER(LogSilent);
 template <typename T>
 struct AskOpt : Ask::Handler<AskOpt<T>> {
   std::string reply;
-  void operator()(Ask, auto r) { r(reply); }
+  void  handle(Ask, auto r) { r(reply); }
   auto on_return(T v) -> std::optional<T> { return std::move(v); }
 };
 
 // Handles Ask by always aborting; on_return wraps T → optional<T> (never called).
 template <typename T>
 struct AskAbort : Ask::Handler<AskAbort<T>> {
-  auto operator()(Ask, auto) -> std::optional<T> { return std::nullopt; }
+  auto  handle(Ask, auto) -> std::optional<T> { return std::nullopt; }
   auto on_return(T v) -> std::optional<T> { return std::move(v); }
 };
 
@@ -127,8 +127,8 @@ using AskLog = Row<Ask, Log>;
 struct ScriptedAskLog : AskLog::Handler<ScriptedAskLog> {
   std::string              name;
   std::vector<std::string> logs;
-  void operator()(Ask, auto r) { r(name); }
-  void operator()(Log e, auto r) { logs.push_back(e.message); r({}); }
+  void  handle(Ask, auto r) { r(name); }
+  void  handle(Log e, auto r) { logs.push_back(e.message); r({}); }
   auto on_return(int v) -> std::tuple<int, std::string, int> {
     return {v, name, static_cast<int>(logs.size())};
   }
@@ -293,7 +293,7 @@ struct AnnotatedAsk : Ask::Handler<AnnotatedAsk> {
   // T is deduced as `int` here (the computation returns int).
   // The handler never mentions int — it works for any non-void T.
   template <typename T>
-  auto operator()(Ask e, fx::TypedResume<Ask, T> k) -> std::string {
+  auto handle(Ask e, fx::TypedResume<Ask, T> k) -> std::string {
     T len = k.resume_and_get("hello");   // T deduced, no explicit <int>
     return "Q=[" + e.prompt + "] A_len=" + std::to_string(len);
   }

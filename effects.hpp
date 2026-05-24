@@ -92,14 +92,14 @@ struct TypedResume : Resume<E> {
   T resume_and_get(typename E::result_type v) const; // defined after fx::resume_and_get
 };
 
-/// Satisfied when H can be called as `h(e, r)` where `e : E` and
+/// Satisfied when H provides `h.handle(e, r)` where `e : E` and
 /// `r : TypedResume<E, int>` (a probe T — any TypedResume<E, *> works).
 /// Use `auto r` in the handler signature; the actual T is deduced at the
 /// call site and forwarded by ScopedHandler.
 template <typename H, typename E>
 concept HandlerFor =
     Effectful<E> &&
-    requires(std::remove_cvref_t<H> &h, E e, TypedResume<E, int> r) { h(e, r); };
+    requires(std::remove_cvref_t<H> &h, E e, TypedResume<E, int> r) { h.handle(e, r); };
 
 /// Satisfied by handler objects that advertise their target effect via
 /// an `effect_type` alias (produced by `Effect::Handler<Derived>` or
@@ -116,12 +116,19 @@ concept TypedHandler =
 /// Thin wrapper that gives an arbitrary lambda an `effect_type` alias so it
 /// satisfies `TypedHandler`.  Constructed by `handler<E>(lambda)` — prefer
 /// that helper over constructing this directly.
+// Lambdas and other raw callables satisfy this when they accept (E, auto r).
+// Used to constrain LambdaHandler<E, F> and handler<E>(fn).
+template <typename F, typename E>
+concept LambdaHandlerFor =
+    Effectful<E> &&
+    requires(std::decay_t<F> &f, E e, TypedResume<E, int> r) { f(e, r); };
+
 template <Effectful E, typename F>
-  requires HandlerFor<F, E>
+  requires LambdaHandlerFor<F, E>
 struct LambdaHandler {
   using effect_type = E;
   F fn;
-  void operator()(E e, auto r) { fn(std::move(e), std::move(r)); }
+  void handle(E e, auto r) { fn(std::move(e), std::move(r)); }
 };
 
 /// Wraps `fn` in a `LambdaHandler<E>` so it can be passed to `.run()`.
@@ -129,7 +136,7 @@ struct LambdaHandler {
 ///   auto h = handler<Ask>([](Ask e, auto r) { r("Alice"); });
 ///   greet().run(h);
 template <Effectful E, typename F>
-  requires HandlerFor<F, E>
+  requires LambdaHandlerFor<F, E>
 auto handler(F &&fn) {
   return LambdaHandler<E, std::decay_t<F>>{std::forward<F>(fn)};
 }
@@ -243,7 +250,7 @@ template <typename... Es, typename... Hs>
 inline constexpr bool all_handled_v<type_list<Es...>, Hs...> =
     (... && effect_is_handled_v<Es, Hs...>);
 
-// True if H provides an operator() for every effect in List.
+// True if H provides handle(E, auto) for every effect in List.
 // Used by the CompositeHandler concept.
 template <typename H, typename List>
 inline constexpr bool all_effects_handled_v = false;
@@ -305,28 +312,28 @@ template <typename H, typename InnerR>
 using on_return_t =
     decltype(std::declval<std::remove_cvref_t<H> &>().on_return(std::declval<InnerR>()));
 
-// Does this TypedHandler's operator()(E, TypedResume<E, InnerR>) return non-void?
+// Does this TypedHandler's handle(E, TypedResume<E, InnerR>) return non-void?
 // InnerR is the computation's actual result type at this point in the handler
-// chain — threading it through here is what makes polymorphic-T operators work:
+// chain — threading it through here is what makes polymorphic-T handlers work:
 //
 //   template <typename T>
-//   auto operator()(E e, TypedResume<E, T> k) -> T { ... }  // passthrough: InnerR=T
+//   auto handle(E e, TypedResume<E, T> k) -> T { ... }  // passthrough: InnerR=T
 //
-//   auto operator()(E e, auto k) -> std::string { ... }     // fixed output type
+//   auto handle(E e, auto k) -> std::string { ... }     // fixed output type
 //
 template <typename H, typename InnerR>
 concept HasDrivingOperatorFor =
     TypedHandler<H> &&
-    !std::is_void_v<decltype(std::declval<std::remove_cvref_t<H> &>()(
+    !std::is_void_v<decltype(std::declval<std::remove_cvref_t<H> &>().handle(
         std::declval<typename std::remove_cvref_t<H>::effect_type>(),
         std::declval<TypedResume<typename std::remove_cvref_t<H>::effect_type,
                                  InnerR>>()))>;
 
-// What type does that operator() return (given InnerR as T)?
+// What type does that handle() return (given InnerR as T)?
 template <typename H, typename InnerR>
   requires HasDrivingOperatorFor<H, InnerR>
 using driving_return_for_t =
-    decltype(std::declval<std::remove_cvref_t<H> &>()(
+    decltype(std::declval<std::remove_cvref_t<H> &>().handle(
         std::declval<typename std::remove_cvref_t<H>::effect_type>(),
         std::declval<TypedResume<typename std::remove_cvref_t<H>::effect_type,
                                  InnerR>>()));
@@ -361,7 +368,7 @@ using composed_return_t = typename composed_return<T, Hs...>::type;
 
 /// Satisfied by handler objects that cover *multiple* effects at once.
 /// Requires an `effect_types` alias (a `detail::type_list<Es...>`) and an
-/// `operator()(Ei, auto resume)` overload for every `Ei` in that list.
+/// `handle(Ei, auto resume)` overload for every `Ei` in that list.
 ///
 /// Produced by `Row<Es...>::Handler<Derived>` or `handler<Row>(lambdas...)`.
 /// Composite handlers are accepted by `.run()` just like single-effect ones.
@@ -517,12 +524,12 @@ struct ScopedHandler {
       // plain Resume<E> for composite handlers / handle<E>() (ResultT=void).
       using Token = std::conditional_t<std::is_void_v<ResultT>,
                                        Resume<E>, TypedResume<E, ResultT>>;
-      using Ret = decltype(hh(pa->effect_, Token{pa}));
+      using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
       if constexpr (std::is_void_v<Ret>) {
-        hh(pa->effect_, Token{pa}); // calls r() → resumes coroutine
+        hh.handle(pa->effect_, Token{pa}); // calls r() → resumes coroutine
       } else {
         // Handler returned non-void: abort path. Must NOT call r().
-        auto val = hh(pa->effect_, Token{pa});
+        auto val = hh.handle(pa->effect_, Token{pa});
         pa->abort_base_->aborted     = true;
         pa->abort_base_->abort_owner = n->handler_obj; // = &node or group_id
         pa->abort_base_->abort_value = std::any(std::move(val));
@@ -1059,10 +1066,9 @@ concept RowType = requires { typename R::effects; };
 
 namespace detail {
 
-// True if at least one of Lambdas can handle effect E (by invocability,
-// no effect_type alias required — plain lambdas work).
+// True if at least one of Lambdas (raw callables) can handle effect E.
 template <typename E, typename... Lambdas>
-inline constexpr bool any_handles_v = (HandlerFor<Lambdas, E> || ...);
+inline constexpr bool any_handles_v = (LambdaHandlerFor<Lambdas, E> || ...);
 
 // True if every effect in the list is handled by at least one lambda.
 template <typename EffectList, typename... Lambdas>
@@ -1082,11 +1088,11 @@ template <RowType R, typename... Lambdas> struct CompositeLambdaHandler {
   std::tuple<Lambdas...> fns;
 
   template <Effectful E>
-  void operator()(E e, auto r) {
+  void handle(E e, auto r) {
     std::apply(
         [&](auto &...fn) {
           (... || [&]() -> bool {
-            if constexpr (HandlerFor<std::remove_cvref_t<decltype(fn)>, E>) {
+            if constexpr (LambdaHandlerFor<std::remove_cvref_t<decltype(fn)>, E>) {
               fn(std::move(e), std::move(r));
               return true;
             }
@@ -1169,6 +1175,6 @@ template <typename Self> struct Effect {
 #define VALIDATE_HANDLER(H)                                                    \
   static_assert(                                                               \
       ::fx::TypedHandler<H> || ::fx::CompositeHandler<H>,                      \
-      "'" #H "' is missing operator() for one or more of its declared "        \
-      "effects. Each effect E requires: void operator()(E, auto resume) "      \
+      "'" #H "' is missing handle() for one or more of its declared "          \
+      "effects. Each effect E requires: void handle(E, auto resume) "          \
       "{ ... }")

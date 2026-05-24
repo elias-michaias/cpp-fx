@@ -50,15 +50,15 @@ let ratio() -> All::Fx<std::string> {
 // ---- Composite handler structs ---------------------------------------------
 
 // IO::Handler<Derived> gives `using effect_types = type_list<Ask, Log>`.
-// D must provide operator()(Ask, ...) and operator()(Log, ...).
+// D must provide  handle(Ask, ...) and  handle(Log, ...).
 struct ScriptedIO : IO::Handler<ScriptedIO> {
   std::vector<std::string> answers;
   int idx = 0;
-  void operator()(Ask e, auto r) {
+  void  handle(Ask e, auto r) {
     std::cout << e.prompt << answers[idx] << "\n";
     r(answers[idx++]);
   }
-  void operator()(Log e, auto r) {
+  void  handle(Log e, auto r) {
     std::cout << "[io] " << e.message << "\n";
     r({});
   }
@@ -69,15 +69,15 @@ VALIDATE_HANDLER(ScriptedIO);
 struct ScriptedAll : All::Handler<ScriptedAll> {
   std::vector<std::string> answers;
   int idx = 0;
-  void operator()(Ask e, auto r) {
+  void  handle(Ask e, auto r) {
     std::cout << e.prompt << answers[idx] << "\n";
     r(answers[idx++]);
   }
-  void operator()(Log e, auto r) {
+  void  handle(Log e, auto r) {
     std::cout << "[all] " << e.message << "\n";
     r({});
   }
-  void operator()(Fail e, auto r) {
+  void  handle(Fail e, auto r) {
     std::cout << "[all] FAIL: " << e.reason << " -> -1\n";
     r(-1);
   }

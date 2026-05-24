@@ -47,7 +47,7 @@ auto safe_div(int a, int b) -> Fail::Fx<int> {
 // Always answers with the same scripted string.
 struct ScriptedAsk : Ask::Handler<ScriptedAsk> {
   std::string answer;
-  void operator()(Ask, auto r) { r(answer); }
+  void  handle(Ask, auto r) { r(answer); }
 };
 VALIDATE_HANDLER(ScriptedAsk);
 

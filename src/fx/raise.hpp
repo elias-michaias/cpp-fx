@@ -37,7 +37,7 @@ struct RaiseHandler : Raise<E>::Handler<RaiseHandler<E, InnerR>> {
     auto on_return(InnerR val) -> std::expected<InnerR, E> {
         return std::expected<InnerR, E>{std::move(val)};
     }
-    auto operator()(Raise<E> e, auto /*r*/) -> std::expected<InnerR, E> {
+    auto  handle(Raise<E> e, auto /*r*/) -> std::expected<InnerR, E> {
         return std::unexpected(std::move(e.error));
     }
 };
