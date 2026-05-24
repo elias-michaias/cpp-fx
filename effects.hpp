@@ -354,12 +354,23 @@ template <typename H, typename InnerR, bool HasDriving>
 struct compose_one<H, InnerR, true, HasDriving> {
   using type = on_return_t<H, InnerR>;
 };
-// No on_return but operator() returns non-void (drives via resume):
-// the operator's return type IS the result — passthrough handlers produce
-// InnerR, transform handlers produce whatever their return type is.
+// Lazy wrapper used by compose_one to avoid eagerly instantiating on_return_t
+// when HasReturnClause<H, DrivingR> is false.
+template <typename H, typename R> struct lazy_on_return { using type = on_return_t<H, R>; };
+template <typename R> struct lazy_identity { using type = R; };
+
+// No on_return for InnerR, but operator() returns non-void (drives via resume).
+// If on_return IS defined for the driving result type (DrivingR), chain it so
+// that handle() drives first and on_return() wraps the result.
+// Passthrough handlers (DrivingR == InnerR, no on_return) produce InnerR.
+// Transform handlers (DrivingR != InnerR) produce DrivingR or on_return_t if chained.
 template <typename H, typename InnerR>
 struct compose_one<H, InnerR, false, true> {
-  using type = driving_return_for_t<H, InnerR>;
+  using DrivingR = driving_return_for_t<H, InnerR>;
+  // Use lazy wrappers to avoid instantiating on_return_t when !HasReturnClause.
+  using type = typename std::conditional_t<HasReturnClause<H, DrivingR>,
+                                           lazy_on_return<H, DrivingR>,
+                                           lazy_identity<DrivingR>>::type;
 };
 
 template <typename T, typename... Hs> struct composed_return {
@@ -666,7 +677,17 @@ private:
     if (ab && ab->aborted &&
         ab->abort_owner == static_cast<void *>(&guard.node)) {
       ab->aborted = false;
-      return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+      if constexpr (detail::HasDrivingOperatorFor<Hb, InnerR>) {
+        // Non-void handle: abort_value holds DrivingR, not R.
+        using DrivingR = detail::driving_return_for_t<Hb, InnerR>;
+        auto raw = std::any_cast<DrivingR>(std::move(ab->abort_value));
+        if constexpr (detail::HasReturnClause<Hb, DrivingR>)
+          return std::optional<R>{h.on_return(std::move(raw))};
+        else
+          return std::optional<R>{std::move(raw)};
+      } else {
+        return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+      }
     }
     if (!inner)
       return std::nullopt; // abort still in flight for outer level
