@@ -9,15 +9,15 @@
 //
 // This benchmark compares frame-allocation strategies:
 //
-//  1. Default (global operator new / delete)
+//  0. Global operator new / delete  (explicit baseline)
+//  1. Default (TLS fx::FreeListResource<256,16> — zero annotation)
 //  2. PMR monotonic_buffer_resource backed by a heap buffer (reset per iter)
-//  3. PMR monotonic_buffer_resource backed by a static buffer (reset per iter)
+//  3. fx::ScopedArena — stack-local monotonic buffer (reset per iter)
 //  4. PMR unsynchronized_pool_resource (steady-state block reuse)
-//  5. Hand-rolled O(1) free-list slab
+//  5. fx::ScopedFreeList — O(1) free-list pool
 
 #include "../../effects.hpp"
 #include "bench.hpp"
-#include <array>
 #include <cstddef>
 #include <iostream>
 #include <memory_resource>
@@ -37,75 +37,6 @@ static constexpr std::size_t kFrameEst = 512;
 
 // One extra pointer stored after the frame by PromiseBase::operator new.
 static constexpr std::size_t kFrameSlot = kFrameEst + sizeof(void *);
-
-// ── Hand-rolled free-list slab ───────────────────────────────────────────────
-//
-// Slab of Capacity fixed-size blocks.  Each free block holds a pointer to the
-// next free block (intrusive list).  Alloc and free are O(1).
-//
-// Large allocations fall through to a configurable fallback resource.
-
-template <std::size_t BlockSize, std::size_t Capacity>
-class FreeListSlab : public std::pmr::memory_resource {
-  static_assert(BlockSize >= sizeof(void *), "block too small");
-
-  union alignas(std::max_align_t) Block {
-    std::byte data[BlockSize];
-    Block *next;
-  };
-
-  Block storage_[Capacity];
-  Block *head_ = nullptr;
-  std::pmr::memory_resource *fallback_;
-
-  bool in_slab(void *ptr) const noexcept {
-    return ptr >= storage_ && ptr < storage_ + Capacity;
-  }
-
-  void build_free_list() {
-    for (std::size_t i = 0; i + 1 < Capacity; ++i)
-      storage_[i].next = &storage_[i + 1];
-    storage_[Capacity - 1].next = nullptr;
-    head_ = &storage_[0];
-  }
-
-public:
-  explicit FreeListSlab(
-      std::pmr::memory_resource *fallback = std::pmr::get_default_resource())
-      : fallback_(fallback) {
-    build_free_list();
-  }
-
-  /// Return all slab blocks to the free list (does not affect fallback).
-  void reset() { build_free_list(); }
-
-  std::size_t block_size() const noexcept { return BlockSize; }
-  std::size_t capacity() const noexcept { return Capacity; }
-
-private:
-  void *do_allocate(std::size_t n, std::size_t align) override {
-    if (n > BlockSize || !head_)
-      return fallback_->allocate(n, align); // large / overflow → fallback
-    Block *b = head_;
-    head_ = b->next;
-    return b->data;
-  }
-
-  void do_deallocate(void *ptr, std::size_t n,
-                     std::size_t align) noexcept override {
-    if (!in_slab(ptr)) {
-      fallback_->deallocate(ptr, n, align); // came from fallback
-      return;
-    }
-    auto *b = reinterpret_cast<Block *>(ptr);
-    b->next = head_;
-    head_ = b;
-  }
-
-  bool do_is_equal(const std::pmr::memory_resource &o) const noexcept override {
-    return this == &o;
-  }
-};
 
 // ── Benchmark parameters ─────────────────────────────────────────────────────
 
@@ -145,8 +76,17 @@ int main() {
 
   section("Batch cost (per-coroutine ns)");
 
-  // ── 1. Default (global new/delete) ──────────────────────────────────────
-  print_result(bench("1. Default new/delete", REPS, [&] {
+  // ── 0. Explicit global new/delete (baseline) ────────────────────────────
+  {
+    fx::ScopedAllocator alloc{std::pmr::new_delete_resource()};
+    print_result(bench("0. Global new/delete (baseline)", REPS, [&] {
+      CountHandler h;
+      do_not_optimize(make_batch_coro().run(h));
+    }));
+  }
+
+  // ── 1. Default (TLS free-list slab — zero annotation) ───────────────────
+  print_result(bench("1. Default (TLS slab)", REPS, [&] {
     CountHandler h;
     do_not_optimize(make_batch_coro().run(h));
   }));
@@ -157,23 +97,18 @@ int main() {
     print_result(bench("2. Monotonic (heap buf, reset/iter)", REPS, [&] {
       std::pmr::monotonic_buffer_resource arena{
           buf.data(), buf.size(), std::pmr::null_memory_resource()};
-      fx::ScopedAllocator alloc{&arena};
+      fx::ScopedAllocator alloc{arena};
       CountHandler h;
       do_not_optimize(make_batch_coro().run(h));
     }));
   }
 
-  // ── 3. PMR monotonic — static (non-heap) buffer, reset each iter ────────
-  {
-    static std::array<std::byte, kArena> sbuf;
-    print_result(bench("3. Monotonic (static buf, reset/iter)", REPS, [&] {
-      std::pmr::monotonic_buffer_resource arena{
-          sbuf.data(), sbuf.size(), std::pmr::null_memory_resource()};
-      fx::ScopedAllocator alloc{&arena};
-      CountHandler h;
-      do_not_optimize(make_batch_coro().run(h));
-    }));
-  }
+  // ── 3. fx::ScopedArena — stack-local monotonic buffer, reset each iter ───
+  print_result(bench("3. ScopedArena<kArena> (stack buf, reset/iter)", REPS, [&] {
+    fx::ScopedArena<kArena> arena;
+    CountHandler h;
+    do_not_optimize(make_batch_coro().run(h));
+  }));
 
   // ── 4. PMR pool — steady-state reuse ────────────────────────────────────
   {
@@ -181,7 +116,7 @@ int main() {
     std::pmr::monotonic_buffer_resource backing{
         pbuf.data(), pbuf.size(), std::pmr::null_memory_resource()};
     std::pmr::unsynchronized_pool_resource pool{&backing};
-    fx::ScopedAllocator alloc{&pool};
+    fx::ScopedAllocator alloc{pool};
 
     print_result(bench("4. PMR pool (steady-state)", REPS, [&] {
       CountHandler h;
@@ -189,13 +124,11 @@ int main() {
     }));
   }
 
-  // ── 5. Hand-rolled free-list slab ────────────────────────────────────────
+  // ── 5. fx::ScopedFreeList — O(1) free-list pool ──────────────────────────
   {
-    static FreeListSlab<kFrameSlot, 4> slab;
-    fx::ScopedAllocator alloc{&slab};
-
-    print_result(bench("5. Free-list slab (O(1), no vdispatch)", REPS, [&] {
-      slab.reset();
+    fx::ScopedFreeList<kFrameSlot, 4> pool;
+    print_result(bench("5. ScopedFreeList (O(1) pool)", REPS, [&] {
+      pool.reset();
       CountHandler h;
       do_not_optimize(make_batch_coro().run(h));
     }));
@@ -215,8 +148,17 @@ int main() {
 
   auto sp_make = []() -> Tick::Fx<int> { co_return perform(Tick{}); };
 
-  // 1s. Default
-  print_result(bench("1s. Default", SP_REPS, [&] {
+  // 0s. Global new/delete (baseline)
+  {
+    fx::ScopedAllocator alloc{std::pmr::new_delete_resource()};
+    print_result(bench("0s. Global new/delete (baseline)", SP_REPS, [&] {
+      CountHandler h;
+      do_not_optimize(sp_make().run(h));
+    }));
+  }
+
+  // 1s. Default (TLS free-list slab)
+  print_result(bench("1s. Default (TLS slab)", SP_REPS, [&] {
     CountHandler h;
     do_not_optimize(sp_make().run(h));
   }));
@@ -234,12 +176,11 @@ int main() {
     }));
   }
 
-  // 5s. Free-list slab (2 slots — one frame at a time)
+  // 5s. fx::ScopedFreeList (2 slots — one frame at a time)
   {
-    static FreeListSlab<kFrameSlot, 2> mini_slab;
-    fx::ScopedAllocator a5{&mini_slab};
-    print_result(bench("5s. Free-list slab", SP_REPS, [&] {
-      mini_slab.reset();
+    fx::ScopedFreeList<kFrameSlot, 2> mini_pool;
+    print_result(bench("5s. ScopedFreeList (O(1) pool)", SP_REPS, [&] {
+      mini_pool.reset();
       CountHandler h;
       do_not_optimize(sp_make().run(h));
     }));

@@ -257,10 +257,10 @@ struct PromiseAbortBase {
   // Compile-time index of the performing effect in declared_effects — set
   // by await_suspend so run_push() base can use O(1) table lookup.
   uint8_t effect_index = 0;
-  // Previously abort_owner (8B) + abort_value (AnyVal=48B) = 56B lived here
-  // on every frame.  Now a single pointer: null on the common resuming path;
-  // heap-allocated once the first time a handler returns non-void.  Saves
-  // 48 bytes from every coroutine frame.
+  // Non-owning pointer into the aborting handler's ScopedHandler (which lives
+  // on the C++ call stack for the full duration of run_push).  Null on the
+  // common resuming path; set by the dispatch lambda when a handler aborts.
+  // Never heap-allocated — zero dynamic allocation even on the abort path.
   AbortContext *abort_ctx = nullptr;
 
   // Moved here from PromiseBase so that resume can reach them
@@ -274,8 +274,8 @@ struct PromiseAbortBase {
   // Set by get_return_object().  Null for Fx<void> computations.
   void *result_ptr = nullptr;
 
-  // Free any outstanding AbortContext (handles exception-path leaks).
-  ~PromiseAbortBase() { delete abort_ctx; }
+  // abort_ctx is non-owning; storage lives in the aborting ScopedHandler.
+  ~PromiseAbortBase() = default;
 };
 
 struct HandlerNode {
@@ -291,6 +291,11 @@ struct HandlerNode {
   // is not a TypedHandler.
   using on_return_any_fn_t = AnyVal (*)(void *, AnyVal &&);
   on_return_any_fn_t on_return_any_fn = nullptr;
+  // Per-node abort result storage.  The dispatch lambda writes the aborting
+  // handler's result here and sets abort_ctx = &this->abort_storage on the
+  // promise.  Lives on the C++ call stack (inside ScopedHandler) for the
+  // full duration of run_push — always valid when accessed.  Zero heap.
+  AbortContext abort_storage;
 };
 
 #ifdef FX_NO_TLS
@@ -321,6 +326,104 @@ inline void dispatch_effect(const void *tag, void *payload_ptr) {
   }
   throw std::runtime_error(
       "fx: unhandled effect -- no matching handler installed");
+}
+
+} // namespace detail
+
+// --- FreeListResource -------------------------------------------------------
+
+/// Fixed-capacity free-list pool: `Capacity` blocks of exactly `BlockSize`
+/// bytes each.  Alloc and free are O(1).  Requests larger than `BlockSize`, or
+/// overflow when all blocks are in use, fall through to `fallback`
+/// (default: `std::pmr::get_default_resource()`).
+///
+/// Typical use — 16 coroutine frames up to 248 bytes each (256 − ptr overhead):
+/// @code
+///   fx::ScopedFreeList<256, 16> arena;
+///   auto result = my_computation().run(my_handler);
+/// @endcode
+template <std::size_t BlockSize, std::size_t Capacity>
+class FreeListResource : public std::pmr::memory_resource {
+  static_assert(BlockSize >= sizeof(void *),
+                "FreeListResource: BlockSize must be >= sizeof(void*)");
+
+  union alignas(std::max_align_t) Block {
+    std::byte data[BlockSize];
+    Block *next;
+  };
+
+  Block storage_[Capacity];
+  Block *head_ = nullptr;
+  std::pmr::memory_resource *fallback_;
+
+  bool in_slab(const void *ptr) const noexcept {
+    return ptr >= static_cast<const void *>(storage_) &&
+           ptr < static_cast<const void *>(storage_ + Capacity);
+  }
+
+  void build_free_list() noexcept {
+    for (std::size_t i = 0; i + 1 < Capacity; ++i)
+      storage_[i].next = &storage_[i + 1];
+    storage_[Capacity - 1].next = nullptr;
+    head_ = &storage_[0];
+  }
+
+public:
+  explicit FreeListResource(std::pmr::memory_resource *fallback =
+                                std::pmr::get_default_resource()) noexcept
+      : fallback_(fallback) {
+    build_free_list();
+  }
+
+  /// Return all slab blocks to the free list (does not affect fallback).
+  void reset() noexcept { build_free_list(); }
+
+  static constexpr std::size_t block_size() noexcept { return BlockSize; }
+  static constexpr std::size_t capacity() noexcept { return Capacity; }
+
+private:
+  void *do_allocate(std::size_t n, std::size_t /*align*/) override {
+    if (n > BlockSize || !head_)
+      return fallback_->allocate(n, alignof(std::max_align_t));
+    Block *b = head_;
+    head_ = b->next;
+    return b->data;
+  }
+
+  void do_deallocate(void *ptr, std::size_t n,
+                     std::size_t /*align*/) noexcept override {
+    if (!in_slab(ptr)) {
+      fallback_->deallocate(ptr, n, alignof(std::max_align_t));
+      return;
+    }
+    auto *b = static_cast<Block *>(ptr);
+    b->next = head_;
+    head_ = b;
+  }
+
+  bool do_is_equal(const std::pmr::memory_resource &o) const noexcept override {
+    return this == &o;
+  }
+};
+
+namespace detail {
+
+// Thread-local default free-list slab installed on every thread.
+// Covers frames up to (256 - sizeof(void*)) bytes; larger frames overflow to
+// get_default_resource() (global new/delete by default).
+// 16 blocks × 256 bytes = 4 KiB per thread.  Not present under FX_NO_TLS.
+#ifndef FX_NO_TLS
+inline thread_local FreeListResource<256, 16> default_slab_{};
+#endif
+
+// Returns the memory resource to use for coroutine frame allocation.
+// Priority: explicit ScopedAllocator > thread-local default slab > global new.
+inline std::pmr::memory_resource *effective_mr() noexcept {
+#ifdef FX_NO_TLS
+  return current_mr;
+#else
+  return current_mr ? current_mr : &default_slab_;
+#endif
 }
 
 } // namespace detail
@@ -611,7 +714,7 @@ template <typename... Es> struct PromiseBase : PromiseAbortBase {
   // can always route back to the same resource even if the allocator changes.
   static void *operator new(std::size_t n) {
     constexpr std::size_t kPtrSize = sizeof(std::pmr::memory_resource *);
-    auto *mr = current_mr;
+    auto *mr = effective_mr();
     std::size_t total = n + kPtrSize;
     void *raw = mr ? mr->allocate(total, alignof(std::max_align_t))
                    : ::operator new(total);
@@ -766,10 +869,9 @@ struct ScopedHandler {
           hh.handle(pa->effect_, Token{pa});
         } else {
           auto val = hh.handle(pa->effect_, Token{pa});
-          if (!pa->abort_base_->abort_ctx)
-            pa->abort_base_->abort_ctx = new detail::AbortContext();
-          pa->abort_base_->abort_ctx->owner = n->handler_obj;
-          pa->abort_base_->abort_ctx->value.emplace(std::move(val));
+          n->abort_storage.owner = n->handler_obj;
+          n->abort_storage.value.emplace(std::move(val));
+          pa->abort_base_->abort_ctx = &n->abort_storage;
           pa->abort_base_->aborted = true;
         }
       } else if constexpr (detail::HasReturnClause<std::remove_cvref_t<H>,
@@ -792,10 +894,9 @@ struct ScopedHandler {
                                Token{pa, &detail::apply_on_return<Hb, ResultT>,
                                      static_cast<void *>(&hh),
                                      &detail::extract_result_impl<RawT>, n});
-          if (!pa->abort_base_->abort_ctx)
-            pa->abort_base_->abort_ctx = new detail::AbortContext();
-          pa->abort_base_->abort_ctx->owner = n->handler_obj;
-          pa->abort_base_->abort_ctx->value.emplace(std::move(val));
+          n->abort_storage.owner = n->handler_obj;
+          n->abort_storage.value.emplace(std::move(val));
+          pa->abort_base_->abort_ctx = &n->abort_storage;
           pa->abort_base_->aborted = true;
         }
       } else {
@@ -807,10 +908,9 @@ struct ScopedHandler {
         } else {
           // Handler returned non-void: abort path. Must NOT call r().
           auto val = hh.handle(pa->effect_, Token{pa});
-          if (!pa->abort_base_->abort_ctx)
-            pa->abort_base_->abort_ctx = new detail::AbortContext();
-          pa->abort_base_->abort_ctx->owner = n->handler_obj; // &node or group_id
-          pa->abort_base_->abort_ctx->value.emplace(std::move(val));
+          n->abort_storage.owner = n->handler_obj; // &node or group_id
+          n->abort_storage.value.emplace(std::move(val));
+          pa->abort_base_->abort_ctx = &n->abort_storage;
           pa->abort_base_->aborted = true;
         }
       }
@@ -848,12 +948,99 @@ public:
       : prev_(detail::current_mr) {
     detail::current_mr = mr;
   }
+  explicit ScopedAllocator(std::pmr::memory_resource &mr) noexcept
+      : ScopedAllocator(&mr) {}
   ~ScopedAllocator() noexcept { detail::current_mr = prev_; }
   ScopedAllocator(const ScopedAllocator &) = delete;
   ScopedAllocator &operator=(const ScopedAllocator &) = delete;
 
 private:
   std::pmr::memory_resource *prev_;
+};
+
+// --- Arena ergonomics -------------------------------------------------------
+
+/// Monotonic bump-allocator backed by an inline buffer of `N` bytes.
+/// Overflow (buffer exhausted) throws `std::bad_alloc` via
+/// `null_memory_resource()`.  Deallocation is a no-op; memory is reclaimed
+/// when the resource itself is destroyed.  Suitable for short-lived
+/// computations that complete before the resource goes out of scope.
+template <std::size_t N>
+class MonotonicResource : public std::pmr::memory_resource {
+  alignas(std::max_align_t) std::byte buf_[N];
+  std::pmr::monotonic_buffer_resource arena_{buf_, N,
+                                             std::pmr::null_memory_resource()};
+
+public:
+  MonotonicResource() = default;
+  MonotonicResource(const MonotonicResource &) = delete;
+  MonotonicResource &operator=(const MonotonicResource &) = delete;
+
+private:
+  void *do_allocate(std::size_t n, std::size_t a) override {
+    return arena_.allocate(n, a);
+  }
+  void do_deallocate(void *, std::size_t, std::size_t) noexcept override {}
+  bool do_is_equal(const std::pmr::memory_resource &o) const noexcept override {
+    return this == &o;
+  }
+};
+
+/// One-liner scoped arena: inline monotonic buffer + `ScopedAllocator` combined.
+///
+/// @code
+///   fx::ScopedArena<4096> arena;          // 4 KiB on the stack
+///   auto result = my_computation().run(my_handler);
+/// @endcode
+template <std::size_t N>
+class ScopedArena {
+  MonotonicResource<N> mr_;
+  ScopedAllocator alloc_;
+
+public:
+  ScopedArena() : alloc_(mr_) {}
+  ScopedArena(const ScopedArena &) = delete;
+  ScopedArena &operator=(const ScopedArena &) = delete;
+};
+
+/// One-liner scoped free-list pool: `FreeListResource` + `ScopedAllocator`
+/// combined.  The pool can be `reset()` between batches to reuse its blocks.
+///
+/// @code
+///   fx::ScopedFreeList<256, 16> pool;     // 16 × 256 B on the stack
+///   for (auto& task : tasks) task().run(handler);   // each frame reuses pool
+///   // pool.reset() if needed between outer loops
+/// @endcode
+template <std::size_t BlockSize, std::size_t Capacity>
+class ScopedFreeList {
+  FreeListResource<BlockSize, Capacity> mr_;
+  ScopedAllocator alloc_;
+
+public:
+  ScopedFreeList() : alloc_(mr_) {}
+  ScopedFreeList(const ScopedFreeList &) = delete;
+  ScopedFreeList &operator=(const ScopedFreeList &) = delete;
+
+  /// Return all pool blocks to the free list (does not affect fallback).
+  void reset() noexcept { mr_.reset(); }
+};
+
+/// RAII guard that makes coroutine frame allocation a hard error in the
+/// current scope.  Any `perform()` or coroutine creation attempt will
+/// throw `std::bad_alloc`.  Useful for enforcing heap-less invariants in
+/// tests or safety-critical paths.
+///
+/// @code
+///   fx::no_heap guard;
+///   my_computation().run(handler);  // throws if any frame allocation occurs
+/// @endcode
+struct no_heap {
+  no_heap() : impl_(std::pmr::null_memory_resource()) {}
+  no_heap(const no_heap &) = delete;
+  no_heap &operator=(const no_heap &) = delete;
+
+private:
+  ScopedAllocator impl_;
 };
 
 // --- Fx<T, Es...> -----------------------------------------------------------
@@ -958,21 +1145,18 @@ private:
       if constexpr (detail::HasReturnClause<Hb, InnerR>) {
         // Koka path: dispatch passed Cont<E, OutT> so handle returned OutT = R.
         auto result = ctx->value.template take<R>();
-        delete ctx;
         return std::optional<R>{std::move(result)};
       } else if constexpr (detail::HasDrivingOperatorFor<Hb, InnerR>) {
         // Non-void handle without Koka on_return(InnerR):
         // abort_ctx->value holds DrivingR; optionally chain on_return.
         using DrivingR = detail::driving_return_for_t<Hb, InnerR>;
         auto raw = ctx->value.template take<DrivingR>();
-        delete ctx;
         if constexpr (detail::HasReturnClause<Hb, DrivingR>)
           return std::optional<R>{h.on_return(std::move(raw))};
         else
           return std::optional<R>{std::move(raw)};
       } else {
         auto result = ctx->value.template take<R>();
-        delete ctx;
         return std::optional<R>{std::move(result)};
       }
     }
@@ -1017,7 +1201,6 @@ private:
       ab->aborted = false;
       auto *ctx = std::exchange(ab->abort_ctx, nullptr);
       auto result = ctx->value.template take<R>();
-      delete ctx;
       return std::optional<R>{std::move(result)};
     }
     if (!inner)
