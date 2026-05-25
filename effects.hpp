@@ -54,6 +54,10 @@ concept Effectful = requires { typename E::result_type; };
 // Full definition is in the perform() section below.
 template <Effectful E> class PerformAwaitable;
 
+namespace detail {
+struct HandlerNode; // forward declaration for Cont<E,T>
+} // namespace detail
+
 /// Lightweight resume token passed to handlers instead of std::function.
 /// Stores a single pointer into the coroutine frame — no heap allocation,
 /// no type erasure, no virtual dispatch.  Call r(value) to resume.
@@ -85,10 +89,32 @@ template <Effectful E> struct Resume {
 /// Inherits from Resume<E> so handlers that take an explicit `Resume<E>`
 /// parameter continue to work unchanged.
 template <Effectful E, typename T> struct Cont : Resume<E> {
-  explicit Cont(PerformAwaitable<E> *pa) noexcept : Resume<E>{pa} {}
+  /// Transform fn: takes (ctx, std::any&&) and returns T.
+  /// The std::any carries the final result after all inner on_returns are applied.
+  using transform_fn_t = T (*)(void *, std::any &&);
+  /// Extract fn: pulls RawT out of the promise's result_ptr and boxes it as std::any.
+  using extract_fn_t = std::any (*)(void *);
+
+  explicit Cont(PerformAwaitable<E> *pa) noexcept
+      : Resume<E>{pa}, transform_fn_{nullptr}, transform_ctx_{nullptr},
+        extract_fn_{nullptr}, own_node_{nullptr} {}
+
+  /// Koka-semantics constructor: fires on_return inside resume() in FIFO order.
+  explicit Cont(PerformAwaitable<E> *pa, transform_fn_t fn, void *ctx,
+                extract_fn_t ext_fn,
+                detail::HandlerNode *own_node) noexcept
+      : Resume<E>{pa}, transform_fn_{fn}, transform_ctx_{ctx},
+        extract_fn_{ext_fn}, own_node_{own_node} {}
+
   /// Drive the continuation to completion and return the final result as T.
-  /// Equivalent to fx::resume<T>(*this, v) without the explicit <T>.
+  /// When constructed with a transform (Koka semantics), all inner handlers'
+  /// on_return clauses fire in FIFO order before this handler's own transform.
   T resume(typename E::result_type v) const; // defined after fx::resume
+
+  transform_fn_t transform_fn_;
+  void *transform_ctx_;
+  extract_fn_t extract_fn_;
+  detail::HandlerNode *own_node_;
 };
 
 /// Satisfied when H provides `h.handle(e, r)` where `e : E` and
@@ -171,6 +197,11 @@ struct HandlerNode {
       nullptr; // actual handler object pointer (used by dispatch lambda)
   void (*dispatch)(void *node_self, void *payload) = nullptr;
   HandlerNode *prev = nullptr;
+  // Used by Cont::resume() FIFO walk: applies this handler's on_return to
+  // the boxed intermediate result.  Null if the handler has no on_return or
+  // is not a TypedHandler.
+  using on_return_any_fn_t = std::any (*)(void *, std::any &&);
+  on_return_any_fn_t on_return_any_fn = nullptr;
 };
 
 inline thread_local HandlerNode *stack_top = nullptr;
@@ -519,15 +550,46 @@ template <Effectful E, typename T, Effectful... Es>
 using remove_effect_t = detail::fx_from_list_t<
     T, typename detail::remove_from_list<E, detail::type_list<Es...>>::type>;
 
+namespace detail {
+/// Applies H::on_return(InnerR) to a boxed std::any value, returning the
+/// result boxed as std::any.  Used by Cont::resume() FIFO walk.
+template <typename H, typename InnerR>
+std::any on_return_any_impl(void *ctx, std::any &&val) {
+  using Hb = std::remove_cvref_t<H>;
+  return std::any(
+      static_cast<Hb *>(ctx)->on_return(std::any_cast<InnerR>(std::move(val))));
+}
+
+/// Extracts the RawT value from the promise's result_ptr (an optional<RawT>*)
+/// and returns it boxed as std::any.
+template <typename RawT>
+std::any extract_result_impl(void *result_ptr) {
+  auto &opt = *static_cast<std::optional<RawT> *>(result_ptr);
+  return std::any(std::move(*opt));
+}
+
+/// Applies H::on_return(InnerR) to a value delivered as std::any&&.
+/// Returns on_return_t<H, InnerR>.  Used as the Cont::transform_fn_.
+template <typename H, typename InnerR>
+on_return_t<std::remove_cvref_t<H>, InnerR> apply_on_return(void *ctx,
+                                                             std::any &&val) {
+  using Hb = std::remove_cvref_t<H>;
+  return static_cast<Hb *>(ctx)->on_return(
+      std::any_cast<InnerR>(std::move(val)));
+}
+} // namespace detail
+
 // --- ScopedHandler ----------------------------------------------------------
 
 /// `ResultT` is the computation's result type at this handler's level.
+/// `RawT` is the undecorated coroutine result type (= Fx<T,...>::value_type).
 /// When non-void (set by run_push for TypedHandlers), the dispatch lambda
 /// passes a `Cont<E, ResultT>` so the handler's template operator()
 /// can deduce T without an explicit template argument.
 /// Composite handlers and handle<E>() use the default `void`, which falls
 /// back to passing the plain `Resume<E>` (no driving-operator support needed).
-template <Effectful E, typename H, typename ResultT = void>
+template <Effectful E, typename H, typename ResultT = void,
+          typename RawT = ResultT>
   requires HandlerFor<H, E>
 struct ScopedHandler {
   detail::HandlerNode node;
@@ -541,25 +603,69 @@ struct ScopedHandler {
     //   instance) • CompositeHandler path → group_id supplied by
     //   run_push_composite → shared token
     node.handler_obj = group_id ? group_id : static_cast<void *>(&node);
+    // Set on_return_any_fn so that Cont::resume() can apply this handler's
+    // on_return during the inner-chain FIFO walk.  Only set for typed handlers
+    // that actually declare on_return(ResultT).
+    if constexpr (!std::is_void_v<ResultT> &&
+                  detail::HasReturnClause<std::remove_cvref_t<H>, ResultT>) {
+      node.on_return_any_fn =
+          &detail::on_return_any_impl<std::remove_cvref_t<H>, ResultT>;
+    }
     node.dispatch = [](void *node_self, void *raw) {
-      // node_self == the HandlerNode* itself (passed by dispatch_effect)
       auto *n = reinterpret_cast<detail::HandlerNode *>(node_self);
       auto &hh =
           *reinterpret_cast<std::remove_reference_t<H> *>(n->real_handler_ptr);
       auto *pa = reinterpret_cast<PerformAwaitable<E> *>(raw);
-      // Pass Cont<E, ResultT> when ResultT is known; fall back to
-      // plain Resume<E> for composite handlers / handle<E>() (ResultT=void).
-      using Token = std::conditional_t<std::is_void_v<ResultT>, Resume<E>,
-                                       Cont<E, ResultT>>;
-      using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
-      if constexpr (std::is_void_v<Ret>) {
-        hh.handle(pa->effect_, Token{pa}); // calls r() → resumes coroutine
+
+      if constexpr (std::is_void_v<ResultT>) {
+        // Composite / handle<E>() path — pass plain Resume<E>.
+        using Token = Resume<E>;
+        using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
+        if constexpr (std::is_void_v<Ret>) {
+          hh.handle(pa->effect_, Token{pa});
+        } else {
+          auto val = hh.handle(pa->effect_, Token{pa});
+          pa->abort_base_->aborted = true;
+          pa->abort_base_->abort_owner = n->handler_obj;
+          pa->abort_base_->abort_value = std::any(std::move(val));
+        }
+      } else if constexpr (detail::HasReturnClause<std::remove_cvref_t<H>,
+                                                   ResultT>) {
+        // Koka semantics: handler has on_return(ResultT); pass Cont<E, OutT>
+        // with a transform so that k.resume() fires all inner on_returns in
+        // FIFO order and then applies this handler's own on_return.
+        using Hb = std::remove_cvref_t<H>;
+        using OutT = detail::on_return_t<Hb, ResultT>;
+        using Token = Cont<E, OutT>;
+        // unevaluated probe to deduce Ret — Token{pa} here is just type-sugar
+        using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
+        if constexpr (std::is_void_v<Ret>) {
+          hh.handle(pa->effect_,
+                    Token{pa, &detail::apply_on_return<Hb, ResultT>,
+                          static_cast<void *>(&hh),
+                          &detail::extract_result_impl<RawT>, n});
+        } else {
+          auto val = hh.handle(pa->effect_,
+                               Token{pa, &detail::apply_on_return<Hb, ResultT>,
+                                    static_cast<void *>(&hh),
+                                    &detail::extract_result_impl<RawT>, n});
+          pa->abort_base_->aborted = true;
+          pa->abort_base_->abort_owner = n->handler_obj;
+          pa->abort_base_->abort_value = std::any(std::move(val));
+        }
       } else {
-        // Handler returned non-void: abort path. Must NOT call r().
-        auto val = hh.handle(pa->effect_, Token{pa});
-        pa->abort_base_->aborted = true;
-        pa->abort_base_->abort_owner = n->handler_obj; // = &node or group_id
-        pa->abort_base_->abort_value = std::any(std::move(val));
+        // Plain Cont<E, ResultT> — no Koka transform.
+        using Token = Cont<E, ResultT>;
+        using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
+        if constexpr (std::is_void_v<Ret>) {
+          hh.handle(pa->effect_, Token{pa}); // calls r() → resumes coroutine
+        } else {
+          // Handler returned non-void: abort path. Must NOT call r().
+          auto val = hh.handle(pa->effect_, Token{pa});
+          pa->abort_base_->aborted = true;
+          pa->abort_base_->abort_owner = n->handler_obj; // = &node or group_id
+          pa->abort_base_->abort_value = std::any(std::move(val));
+        }
       }
     };
     saved = detail::stack_top;
@@ -671,9 +777,9 @@ private:
     using Hb = std::remove_cvref_t<H>;
     using InnerR = detail::composed_return_t<T, Rest...>;
     using R = detail::composed_return_t<T, H, Rest...>;
-    // Pass InnerR so the dispatch lambda can construct Cont<E, InnerR>
-    // and the handler's template operator() can deduce T = InnerR.
-    ScopedHandler<typename Hb::effect_type, Hb, InnerR> guard{h};
+    // Pass InnerR as ResultT and T (the coroutine's raw result type) as RawT
+    // so the FIFO walk in Cont::resume() can extract the raw result correctly.
+    ScopedHandler<typename Hb::effect_type, Hb, InnerR, T> guard{h};
     auto inner = run_push(rest...);
     auto *ab = get_abort_base();
     // Did THIS handler abort? Compare against the node's own address (unique
@@ -682,8 +788,13 @@ private:
     if (ab && ab->aborted &&
         ab->abort_owner == static_cast<void *>(&guard.node)) {
       ab->aborted = false;
-      if constexpr (detail::HasDrivingOperatorFor<Hb, InnerR>) {
-        // Non-void handle: abort_value holds DrivingR, not R.
+      if constexpr (detail::HasReturnClause<Hb, InnerR>) {
+        // Koka path: dispatch passed Cont<E, OutT> so handle returned OutT = R.
+        // abort_value already holds R; cast directly.
+        return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+      } else if constexpr (detail::HasDrivingOperatorFor<Hb, InnerR>) {
+        // Non-void handle without Koka on_return(InnerR):
+        // abort_value holds DrivingR; optionally chain on_return(DrivingR).
         using DrivingR = detail::driving_return_for_t<Hb, InnerR>;
         auto raw = std::any_cast<DrivingR>(std::move(ab->abort_value));
         if constexpr (detail::HasReturnClause<Hb, DrivingR>)
@@ -694,8 +805,21 @@ private:
         return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
       }
     }
-    if (!inner)
-      return std::nullopt; // abort still in flight for outer level
+    if (!inner) {
+      // Abort still in flight for an outer level.  Best-effort: apply this
+      // handler's on_return to the abort_value if its type matches InnerR,
+      // so that on_return fires even on the abort path.
+      if constexpr (detail::HasReturnClause<Hb, InnerR>) {
+        if (ab && ab->aborted) {
+          try {
+            auto v = std::any_cast<InnerR>(ab->abort_value);
+            ab->abort_value = std::any(h.on_return(std::move(v)));
+          } catch (std::bad_any_cast const &) {
+          }
+        }
+      }
+      return std::nullopt;
+    }
     // Normal path — apply return clause if declared.
     if constexpr (detail::HasReturnClause<Hb, InnerR>)
       return std::optional<R>{h.on_return(std::move(*inner))};
@@ -1029,6 +1153,36 @@ T resume(Resume<E> k, typename E::result_type v) {
 // Must be defined after fx::resume since it delegates to it.
 template <Effectful E, typename T>
 T Cont<E, T>::resume(typename E::result_type v) const {
+  if (transform_fn_) {
+    // Koka semantics: drive the continuation inline, then apply inner handlers'
+    // on_return clauses in FIFO order (innermost first) before this handler's
+    // own transform.  This ensures each handler sees the shape its own
+    // on_return produces — e.g. run(OuterWrap, InnerLog) where InnerLog wraps
+    // in optional: OuterWrap.k.resume() fires InnerLog.on_return first, then
+    // OuterWrap.on_return sees the optional.
+    this->pa->result_ = std::move(v);
+    auto *ab = this->pa->abort_base_;
+    this->pa->caller_.resume();
+    while (!this->pa->caller_.done()) {
+      detail::dispatch_effect(ab->effect_tag, ab->payload_ptr);
+      if (ab->aborted)
+        throw std::runtime_error(
+            "fx::resume: computation aborted by a nested handler");
+    }
+    if (ab->exception)
+      std::rethrow_exception(ab->exception);
+    // Extract the raw result from the promise into a std::any.
+    std::any current = extract_fn_(ab->result_ptr);
+    // Walk inner handlers (from innermost toward own_node_, exclusive) and
+    // apply each one's on_return in FIFO order.
+    for (auto *n = detail::stack_top; n != own_node_ && n != nullptr;
+         n = n->prev) {
+      if (n->on_return_any_fn) {
+        current = n->on_return_any_fn(n->real_handler_ptr, std::move(current));
+      }
+    }
+    return transform_fn_(transform_ctx_, std::move(current));
+  }
   return ::fx::resume<T>(*this, std::move(v));
 }
 

@@ -30,14 +30,19 @@
 // once
 // 21.  Three handlers stacked; all void handle + on_return; chain runs
 // bottom-up
-// 22.  Non-void handle (drives via k.resume) AND on_return: single-handler
-// case;
-//      handle returns DrivingR, on_return wraps DrivingR → final type
-// 23.  Non-void handle where DrivingR ≠ InnerR (string vs int) + on_return
-// chains
-//      from DrivingR; inner void handlers are bypassed as usual
-// 24.  Outer non-void handle + inner void handle+on_return: inner on_return is
-//      bypassed by the outer driving abort; only outer's on_return fires
+// 22.  Koka-style driving handler: on_return fires inside k.resume(); handle
+//      sees OutT (already-wrapped) directly — no manual type conversion needed
+// 23.  Non-void handle where DrivingR ≠ InnerR (classic DrivingR path, no
+// Koka):
+//      handle produces string from int; on_return(DrivingR) chains to pair
+// 24.  Koka outer handler + inner void handle+on_return: FIFO semantics —
+//      inner on_return fires inside k.resume() before outer Koka handler sees result
+// 25.  Three-handler FIFO stack (happy path): 3 on_returns chain innermost-first
+// 26.  Three-handler FIFO stack (Fail resumption): Fail resumed, all on_returns fire
+// 27a. FIFO composition order: LogAddLarge(Log,+1000) outer, FailMul2(Fail,×2) inner
+// 27b. FIFO composition order reversed: +1000 fires before ×2 → different result
+// 28.  KokaAnnotate + LogAddLarge: inner on_return fires inside k.resume(),
+//      KokaAnnotate.handle sees already-transformed pair
 
 #include "common.hpp"
 
@@ -625,23 +630,21 @@ VALIDATE_HANDLER(FailCount);
 
 // ---- Handlers for tests 22-24 -----------------------------------------------
 
-// Non-void handle (Cont-style): drives computation to completion via
-// k.resume(), doubles the raw result.  Also has on_return that wraps the
-// driving result. DrivingR = int (same as InnerR here); on_return: int →
-// pair<int, string>.
-struct DriveAndDouble : Ask::Handler<DriveAndDouble> {
-  template <typename T> int handle(Ask, Cont<Ask, T> k) {
-    T raw = k.resume("world");
-    return static_cast<int>(raw) * 2; // DrivingR = int
-  }
+// Koka-style driving handler: on_return fires INSIDE k.resume() so the handle
+// function sees OutT = pair<int,string> rather than raw int.
+// Handle simply passes the already-wrapped value through.
+struct KokaWrap : Ask::Handler<KokaWrap> {
+  auto handle(Ask, auto k) { return k.resume("hello"); }
   auto on_return(int v) -> std::pair<int, std::string> {
-    return {v, "doubled=" + std::to_string(v)};
+    return {v, "len=" + std::to_string(v)};
   }
 };
-VALIDATE_HANDLER(DriveAndDouble);
+VALIDATE_HANDLER(KokaWrap);
 
-// Non-void handle where DrivingR ≠ InnerR: drives via k.resume(), produces a
-// string from an int result.  on_return wraps the string → pair<string, int>.
+// Non-void handle where DrivingR ≠ InnerR (old DrivingR path, no Koka).
+// Has on_return(string), NOT on_return(int), so HasReturnClause<H,int>=false.
+// Drive path: handle drives k.resume("Q") → raw int → converts to string.
+// on_return wraps DrivingR=string → pair<string,int>.
 struct DriveAndStringify : Ask::Handler<DriveAndStringify> {
   template <typename T> std::string handle(Ask, Cont<Ask, T> k) {
     T raw = k.resume("Q");
@@ -654,9 +657,23 @@ struct DriveAndStringify : Ask::Handler<DriveAndStringify> {
 };
 VALIDATE_HANDLER(DriveAndStringify);
 
+// Koka handler that ALSO uses the OutT value from k.resume() in handle,
+// performing a further transformation of its own before returning.
+// on_return(int → pair<int,string>); handle unpacks pair and re-annotates.
+struct KokaAnnotate : Ask::Handler<KokaAnnotate> {
+  auto handle(Ask e, auto k) -> std::pair<int, std::string> {
+    auto [n, tag] = k.resume(e.prompt); // OutT = pair<int,string>
+    return {n, e.prompt + ":" + tag};   // re-annotate with prompt
+  }
+  auto on_return(int v) -> std::pair<int, std::string> {
+    return {v, "len=" + std::to_string(v)};
+  }
+};
+VALIDATE_HANDLER(KokaAnnotate);
+
 // Void handle + on_return: handles Log normally, then adds 1000 to the result
 // via on_return.  Used in test 24 to show this on_return is bypassed when an
-// outer driving abort propagates past this level.
+// outer Koka driving handler's abort propagates past this level.
 struct LogAddLarge : Log::Handler<LogAddLarge> {
   void handle(Log, auto r) { r({}); }
   auto on_return(int v) -> int { return v + 1000; }
@@ -795,26 +812,27 @@ static void test_on_return_chain_bottom_up() {
 
 // ---- Tests 22-24 ------------------------------------------------------------
 
-// 22. Non-void handle (DriveAndDouble) + on_return on a single-effect
-// computation.
-//     DriveAndDouble::handle drives k.resume("world") → raw int 5,
-//     returns 5*2 = 10 (DrivingR = int).
-//     The abort path extracts DrivingR (10) then calls on_return(10) = {10,
-//     "doubled=10"}. prompt_length(): Ask::Fx<int> run(DriveAndDouble{}) →
-//     pair<int, string>
-static void test_drive_and_on_return_single() {
-  auto result = prompt_length().run(DriveAndDouble{});
+// 22. Koka-style driving handler: on_return(int → pair<int,string>) fires
+//     INSIDE k.resume() so handle sees the already-wrapped OutT directly.
+//     Handle simply passes the result through — no manual type conversion.
+//
+//     prompt_length(): Ask::Fx<int>
+//     KokaWrap.on_return(5) = {5, "len=5"} fires inside k.resume("hello")
+//     handle returns {5, "len=5"} unchanged → pair<int,string>
+static void test_koka_on_return_fires_inside_resume() {
+  auto result = prompt_length().run(KokaWrap{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
-  assert(result.first == 10);            // "world".size() * 2 == 10
-  assert(result.second == "doubled=10"); // on_return applied to driving result
-  PASS("22. non-void handle + on_return: DrivingR=int extracted from abort; "
-       "on_return(10) = {10, \"doubled=10\"}");
+  assert(result.first == 5); // "hello".size() == 5
+  assert(result.second ==
+         "len=5"); // on_return(5) = {5,"len=5"} from inside resume
+  PASS("22. Koka semantics: on_return fires inside k.resume(); handle sees "
+       "OutT=pair<int,string> directly — no manual cast needed");
 }
 
-// 23. Non-void handle where DrivingR ≠ InnerR.
-//     DriveAndStringify::handle drives k.resume("Q") through the inner Log and
-//     Fail handlers; receives int 4 (12/3), converts to string "result:4"
-//     (DrivingR = string ≠ InnerR = int).
+// 23. Non-void handle where DrivingR ≠ InnerR (classic DrivingR path; no Koka).
+//     DriveAndStringify has on_return(string), NOT on_return(int), so
+//     HasReturnClause<H,InnerR=int>=false → falls through to DrivingR path.
+//     handle drives k.resume("Q") → raw int 4 (12/3) → string "result:4"
 //     on_return("result:4") = {"result:4", 8} via pair<string,int>.
 //     ask_log_div(12, 3): Row<Ask,Log,Fail>::Fx<int>
 //     run(DriveAndStringify{}, LogSilent{}, RecoverFail{-1}) → pair<string,
@@ -825,34 +843,245 @@ static void test_drive_stringify_type_transform() {
   static_assert(std::is_same_v<decltype(result), std::pair<std::string, int>>);
   assert(result.first == "result:4"); // k.resume("Q") → 12/3=4 → "result:4"
   assert(result.second == 8);         // length of "result:4"
-  PASS("23. non-void handle DrivingR(string)≠InnerR(int) + on_return: "
-       "abort extracts string, on_return wraps to pair<string,int>");
+  PASS("23. non-Koka DrivingR path: handle returns string≠InnerR(int); "
+       "on_return(DrivingR) chains to pair<string,int>");
 }
 
-// 24. Outer non-void handle (DriveAndDouble) + inner void handle+on_return
-// (LogAddLarge).
-//     DriveAndDouble drives through ask_then_log(), which performs Log.
-//     LogAddLarge handles the Log during k.resume() — but LogAddLarge.on_return
-//     (which would add 1000) is BYPASSED because the outer driving abort
-//     propagates upward without touching the inner on_return.
-//     The final result is identical to test 22: {10, "doubled=10"}.
+// 24. Koka handler (KokaWrap) drives ask_then_log() through an inner
+//     LogAddLarge handler.  FIFO on_return semantics: LogAddLarge.on_return
+//     fires first (inside k.resume(), before KokaWrap sees the result):
+//       inner int 5 → LogAddLarge.on_return(5) = 1005
+//       then KokaWrap.on_return(1005) = {1005, "len=1005"}
+//
 //     ask_then_log(): Row<Ask,Log>::Fx<int>
-//     run(DriveAndDouble{}, LogAddLarge{}) → pair<int, string>
-static void test_driving_abort_bypasses_inner_on_return() {
-  auto result = ask_then_log().run(DriveAndDouble{}, LogAddLarge{});
+//     run(KokaWrap{}, LogAddLarge{}) → pair<int,string>
+static void test_fifo_on_return_inside_resume() {
+  auto result = ask_then_log().run(KokaWrap{}, LogAddLarge{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
-  // If LogAddLarge.on_return had fired, the inner int would be 5+1000=1005,
-  // and DriveAndDouble would have returned 2010, giving
-  // pair{2010,"doubled=2010"}. Instead we get {10, "doubled=10"} — inner
-  // on_return was bypassed.
-  assert(result.first == 10);
-  assert(result.second == "doubled=10");
-  PASS("24. outer driving abort bypasses inner on_return: "
-       "LogAddLarge.on_return (+1000) skipped; result is {10,\"doubled=10\"} "
-       "not {2010,\"doubled=2010\"}");
+  assert(result.first == 1005);           // LogAddLarge.on_return(5)=1005
+  assert(result.second == "len=1005");    // KokaWrap.on_return(1005)
+  PASS("24. FIFO on_return inside k.resume(): LogAddLarge fires first (+1000), "
+       "KokaWrap sees 1005 → {1005,\"len=1005\"}");
 }
 
-// ---- Main -------------------------------------------------------------------
+// ---- Tests 25-28: FIFO on_return composition --------------------------------
+
+// 25. Two inner void-handle+on_return handlers beneath a Koka driver.
+//     ask_then_multi_log(3): Row<Ask,Log>::Fx<int> (returns 3)
+//     run(KokaWrap{}, LogAddLarge{}, LogCount{})
+//       LogCount.on_return(3)        → pair<int,int>{3,3}  (int → pair<int,int>)
+//       ... but LogCount returns pair<int,int>, not int, so KokaWrap needs
+//     a different setup.
+//
+//     To test a 3-deep FIFO walk, use two LogAddLarge-style handlers both on
+//     Log, but they can't both handle Log without compositing. Instead: use a
+//     single-effect computation (Log::Fx<int>) with three stacked handlers that
+//     each have on_return: two plain LogAdd-style handlers + KokaWrap (on Ask).
+//
+//     multi_log(2): Log::Fx<int> → int 2
+//     Arrangement: run(KokaAsk{driver}, LogAddSmall{}, LogAdd1{})
+//       where KokaAsk handles Ask (but multi_log never asks, so it just drives
+//       the coroutine to completion from the ask side)... this doesn't fire.
+//
+//     Better: use ask_then_log() with two inner handlers each with on_return:
+//       run(KokaWrap{}, LogAdd1{}, LogAdd10{})
+//       Execution: KokaWrap.handle fires, k.resume("hello") drives:
+//         - Log fires → LogAdd1.handle dispatches r({})
+//         - Log fires... but ask_then_log only logs once
+//       After coroutine completes, FIFO walk:
+//         LogAdd10.on_return(5) = 15   (stack top = LogAdd10)
+//         LogAdd1.on_return(15) = 16
+//         KokaWrap.on_return(16) = {16, "len=16"}
+//
+//     But wait: LogAdd1 and LogAdd10 both handle Log — we can't stack two
+//     handlers for the same effect in a plain run() call.
+//
+//     Use: ask_then_log() with separate effects for each inner handler:
+//       Row<Ask, Log, Fail>::Fx<int>-style computation? Too complex.
+//
+//     Simplest valid 3-level FIFO: use a 3-effect computation.
+//     safe_fail_add(): Row<Ask,Log,Fail>::Fx<int>
+//     run(KokaWrap{}, LogAddLarge{}, FailToOpt{})
+//       FailToOpt.on_return(3)  → optional<int>{3}
+//       ... but types would mismatch (LogAddLarge expects int, gets optional).
+//
+//     The only clean N>2 FIFO test requires handlers on DIFFERENT effects so
+//     they can all be stacked.  KokaWrap(Ask) + LogAddLarge(Log) stacked
+//     already gives 2 levels — that's test 24.  For a clean 3rd level, add
+//     FailToOpt(Fail) as the innermost; the computation must perform Fail.
+//
+//     But if Fail fires FailToOpt aborts, so on_return wouldn't run.
+//     We need Fail to NOT abort — i.e. handle Fail by resuming normally.
+//
+//     Use FailResume: handles Fail by resuming with a sentinel; on_return wraps
+//     result in optional.  Then:
+//       safe_fail_add(10,2): perform Fail never fires → on_return applies
+//       run(KokaWrap, LogAddLarge, FailAddOffset)
+//       FailAddOffset.on_return(5) = 500+5=505
+//       LogAddLarge.on_return(505) = 1505
+//       KokaWrap.on_return(1505) = {1505, "len=1505"}
+//
+//     safe_fail_add_comp(): Row<Ask,Log,Fail>::Fx<int>
+//       performs Ask, Log, returns name.size() when b!=0; Fail when b==0
+//     run(KokaWrap, LogAddLarge, FailAddOffset) with happy path (b=2):
+//       int result = "hello".size() = 5
+//       FailAddOffset.on_return(5) = 505
+//       LogAddLarge.on_return(505) = 1505
+//       KokaWrap.on_return(1505) = {1505,"len=1505"}
+
+struct FailAddOffset : Fail::Handler<FailAddOffset> {
+  void handle(Fail, auto r) { r(0); } // resume with 0 on error
+  auto on_return(int v) -> int { return v + 500; }
+};
+VALIDATE_HANDLER(FailAddOffset);
+
+static auto ask_log_fail_comp(bool fail) -> Row<Ask, Log, Fail>::Fx<int> {
+  auto name = perform(Ask{.prompt = "?"});
+  perform(Log{.message = "got " + name});
+  if (fail)
+    co_return perform(Fail{.reason = "forced"});
+  co_return static_cast<int>(name.size());
+}
+
+// 25. Three stacked handlers with on_return: FIFO walk visits them innermost
+//     first.  ask_log_fail_comp(false) = "hello".size() = 5 (happy path).
+//     FailAddOffset.on_return(5)=505, LogAddLarge.on_return(505)=1505,
+//     KokaWrap.on_return(1505)={1505,"len=1505"}
+static void test_fifo_three_handlers_normal_path() {
+  auto result = ask_log_fail_comp(false).run(KokaWrap{}, LogAddLarge{}, FailAddOffset{});
+  static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
+  assert(result.first == 1505);
+  assert(result.second == "len=1505");
+  PASS("25. FIFO 3-handler stack (happy path): FailAddOffset(+500)→LogAddLarge(+1000)"
+       "→KokaWrap.on_return; result={1505,\"len=1505\"}");
+}
+
+// 26. Same 3-handler stack, but the innermost (FailAddOffset) aborts via Fail.
+//     ask_log_fail_comp(true): Fail fires → FailAddOffset.handle resumes with 0.
+//     Then the computation returns 0.
+//     FIFO: FailAddOffset.on_return(0)=500, LogAddLarge.on_return(500)=1500,
+//           KokaWrap.on_return(1500)={1500,"len=1500"}
+static void test_fifo_three_handlers_fail_resumption() {
+  auto result = ask_log_fail_comp(true).run(KokaWrap{}, LogAddLarge{}, FailAddOffset{});
+  static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
+  assert(result.first == 1500);   // FailAddOffset resumes with 0 → on_return(0)=500
+  assert(result.second == "len=1500");
+  PASS("26. FIFO 3-handler stack (Fail resumption): Fail→resume(0)→on_return(0)=500"
+       "→+1000→KokaWrap; result={1500,\"len=1500\"}");
+}
+
+// 27. Composition order matters: swapping inner handlers changes type shape.
+//     run(KokaWrap, FailAddOffset, LogAddLarge)
+//     Innermost = LogAddLarge (on_return int→int, +1000)
+//     Middle    = FailAddOffset (on_return int→int, +500)
+//     KokaWrap  = outer (on_return int→pair<int,string>)
+//
+//     FailAddOffset's InnerR = int (= T = Fx<int>'s T, same as before).
+//     LogAddLarge's InnerR = int too (same Fx<int>).
+//     FIFO walk: LogAddLarge first (+1000), then FailAddOffset (+500).
+//     ask_log_fail_comp(false): 5 → (+1000)=1005 → (+500)=1505 → {1505,"len=1505"}
+//
+//     Hmm, same result.  To show ORDER matters, we need non-commutative ops.
+//     Use: OuterAdd (×2) and InnerAdd (+1000).  5→1000+5=1005→×2=2010 vs
+//          5→×2=10→+1000=1010.
+//
+//     LogMul2: void handle Log, on_return(int v) → int { return v * 2; }
+
+struct LogMul2 : Log::Handler<LogMul2> {
+  void handle(Log, auto r) { r({}); }
+  auto on_return(int v) -> int { return v * 2; }
+};
+VALIDATE_HANDLER(LogMul2);
+
+// run(KokaWrap, LogAddLarge, LogMul2) — two handlers for Log… wait, can't
+// have two handlers for the same effect.  Use a computation with Log and Fail:
+// run(KokaWrap, LogAddLarge(Log), LogMul2(Log)) — same effect, not allowed.
+//
+// Use instead: ask_log_fail_comp with KokaWrap(Ask), LogAddLarge(Log),
+// FailAddOffset(Fail) vs re-ordered KokaWrap(Ask), FailAddOffset(Fail),
+// LogAddLarge(Log).  These share same effect-per-handler set, just different
+// ordering between two inner non-Koka handlers.
+//
+// For ask_log_fail_comp(false)=5:
+//   run(KokaWrap, LogAddLarge, FailAddOffset):
+//     walk: FailAddOffset(+500) first, LogAddLarge(+1000) second → 5+500+1000=1505
+//   run(KokaWrap, FailAddOffset, LogAddLarge):
+//     walk: LogAddLarge(+1000) first, FailAddOffset(+500) second → 5+1000+500=1505
+// Both sum to 1505 (addition is commutative). Use multiply for non-commutativity:
+//   FailAddOffset: +500 → result 505
+//   LogMul2: ×2 → need a handler for a DIFFERENT effect but that uses int
+//
+// Use Ask and Fail (same computation), with KokaWrap(Ask) and two inner handlers
+// FailAddOffset(Fail) and something else... but we only have Ask/Log/Fail.
+// Create AskMul3: handles Ask by resuming "hey" (3 chars), on_return(int) ×3.
+// run(KokaWrap, AskMul3, FailAddOffset) on ask_log_fail_comp:
+//   Two handlers for Ask — illegal.
+//
+// The simplest non-trivial demonstration: a computation with 3 distinct effects
+// and 3 handlers each with on_return, where one is the Koka driver.
+// Use a 2-non-koka stack with ops that compose differently:
+// For 5: (+500 then *2) = 1010; (*2 then +500) = 510.
+// We need a MulHandler on Fail and AddHandler on Log, or vice versa.
+
+struct FailMul2 : Fail::Handler<FailMul2> {
+  void handle(Fail, auto r) { r(0); }
+  auto on_return(int v) -> int { return v * 2; }
+};
+VALIDATE_HANDLER(FailMul2);
+
+// run(KokaWrap, LogAddLarge, FailMul2) on ask_log_fail_comp(false)=5:
+//   FIFO walk (innermost first):
+//     FailMul2.on_return(5)   = 10
+//     LogAddLarge.on_return(10) = 1010
+//     KokaWrap.on_return(1010) = {1010,"len=1010"}
+static void test_fifo_composition_order_matters_a() {
+  auto result = ask_log_fail_comp(false).run(KokaWrap{}, LogAddLarge{}, FailMul2{});
+  static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
+  // FIFO: FailMul2(×2)=10, then LogAddLarge(+1000)=1010
+  assert(result.first == 1010);
+  assert(result.second == "len=1010");
+  PASS("27a. FIFO order: KokaWrap(Ask), LogAddLarge(Log,+1000), FailMul2(Fail,×2)"
+       " → ×2 fires first: 5→10→+1000=1010→{1010,\"len=1010\"}");
+}
+
+// run(KokaWrap, FailMul2, LogAddLarge) on ask_log_fail_comp(false)=5:
+//   FIFO walk (innermost first = LogAddLarge, then FailMul2):
+//     LogAddLarge.on_return(5)  = 1005
+//     FailMul2.on_return(1005)  = 2010
+//     KokaWrap.on_return(2010)  = {2010,"len=2010"}
+static void test_fifo_composition_order_matters_b() {
+  auto result = ask_log_fail_comp(false).run(KokaWrap{}, FailMul2{}, LogAddLarge{});
+  static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
+  // FIFO: LogAddLarge(+1000)=1005, then FailMul2(×2)=2010
+  assert(result.first == 2010);
+  assert(result.second == "len=2010");
+  PASS("27b. FIFO order (reversed inner pair): KokaWrap(Ask), FailMul2(Fail,×2),"
+       " LogAddLarge(Log,+1000)"
+       " → +1000 fires first: 5→1005→×2=2010→{2010,\"len=2010\"}");
+}
+
+// 28. KokaAnnotate (drives ask, re-annotates pair with prompt) + LogAddLarge.
+//     KokaAnnotate.on_return(int) → pair<int,string>{"v","len=v"}
+//     KokaAnnotate.handle(Ask e, k) → auto [n,tag]=k.resume(e.prompt) → re-annotate
+//     ask_then_log(): Row<Ask,Log>::Fx<int>
+//     run(KokaAnnotate{}, LogAddLarge{})
+//
+//     ask_then_log() with ask prompt "?", answer "?":
+//       name = "?" (1 char), int result = 1
+//     FIFO: LogAddLarge.on_return(1) = 1001
+//     KokaAnnotate sees pair {1001,"len=1001"}, re-annotates → {1001,"?:len=1001"}
+static void test_fifo_koka_annotate_with_inner_on_return() {
+  auto result = ask_then_log().run(KokaAnnotate{}, LogAddLarge{});
+  static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
+  // LogAddLarge.on_return("?".size()=1) = 1001
+  // KokaAnnotate.handle receives pair{1001,"len=1001"}, prompt="?":
+  //   returns {1001, "?:len=1001"}
+  assert(result.first == 1001);
+  assert(result.second == "?:len=1001");
+  PASS("28. KokaAnnotate+LogAddLarge FIFO: LogAddLarge fires inside resume,"
+       " KokaAnnotate sees {1001,\"len=1001\"}, re-annotates → {1001,\"?:len=1001\"}");
+}
+
 
 int main() {
   std::cout << "[t6_on_return]\n";
@@ -877,8 +1106,13 @@ int main() {
   test_two_handle_on_return_compose();
   test_temporal_ordering_handle_before_on_return();
   test_on_return_chain_bottom_up();
-  test_drive_and_on_return_single();
+  test_koka_on_return_fires_inside_resume();
   test_drive_stringify_type_transform();
-  test_driving_abort_bypasses_inner_on_return();
+  test_fifo_on_return_inside_resume();
+  test_fifo_three_handlers_normal_path();
+  test_fifo_three_handlers_fail_resumption();
+  test_fifo_composition_order_matters_a();
+  test_fifo_composition_order_matters_b();
+  test_fifo_koka_annotate_with_inner_on_return();
   std::cout << "\nAll tests passed.\n";
 }
