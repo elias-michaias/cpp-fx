@@ -3,7 +3,6 @@
 // Covers:
 //   • E::Fx<T> return type from the Effect<Self> CRTP base
 //   • perform(e) yields control to whatever handler is installed
-//   • handler<E>(lambda) for ad-hoc inline handlers
 //   • E::Handler<Derived> CRTP for reusable named handler structs
 //   • Fx<T> (pure, zero effects) — .run() needs no arguments
 //   • The same computation runs unchanged under different handlers
@@ -42,7 +41,7 @@ auto safe_div(int a, int b) -> Fail::Fx<int> {
   co_return a / b;
 }
 
-// ---- Named handler struct --------------------------------------------------
+// ---- Named handler structs --------------------------------------------------
 
 // Always answers with the same scripted string.
 struct ScriptedAsk : Ask::Handler<ScriptedAsk> {
@@ -51,6 +50,31 @@ struct ScriptedAsk : Ask::Handler<ScriptedAsk> {
 };
 VALIDATE_HANDLER(ScriptedAsk);
 
+// Counts how many times Ask fires; side-channel via reference.
+struct CountingAsk : Ask::Handler<CountingAsk> {
+  int &count;
+  std::string reply;
+  void handle(Ask, auto r) { ++count; r(reply); }
+};
+VALIDATE_HANDLER(CountingAsk);
+
+// Records log messages via reference.
+struct RecordLog : Log::Handler<RecordLog> {
+  std::vector<std::string> &msgs;
+  void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
+};
+VALIDATE_HANDLER(RecordLog);
+
+// Fail handler that prints a warning then resumes with a fallback.
+struct VerboseFail : Fail::Handler<VerboseFail> {
+  int fallback;
+  void handle(Fail e, auto r) {
+    std::cout << "   [warn] " << e.reason << "\n";
+    r(fallback);
+  }
+};
+VALIDATE_HANDLER(VerboseFail);
+
 // ---- Tests -----------------------------------------------------------------
 
 int main() {
@@ -58,15 +82,15 @@ int main() {
   assert(meaning_of_life().run() == 42);
   std::cout << "1. pure Fx<int>: " << meaning_of_life().run() << "\n";
 
-  // 2. Inline lambda handler.
-  auto r2 = greet().run(handler<Ask>([](Ask, auto r) { r("World"); }));
+  // 2. Named handler struct.
+  auto r2 = greet().run(ScriptedAsk{.answer = "World"});
   assert(r2 == "Hello, World!");
-  std::cout << "2. lambda handler: " << r2 << "\n";
+  std::cout << "2. named handler: " << r2 << "\n";
 
-  // 3. Named handler struct.
+  // 3. Same computation under a different named handler.
   auto r3 = greet().run(ScriptedAsk{.answer = "Alice"});
   assert(r3 == "Hello, Alice!");
-  std::cout << "3. named handler: " << r3 << "\n";
+  std::cout << "3. named handler (Alice): " << r3 << "\n";
 
   // 4. The same computation under a different handler — Ask is a plug point,
   //    not hard-coded I/O.
@@ -80,14 +104,8 @@ int main() {
   //    computation.
   int ask_count = 0;
   std::vector<std::string> log_msgs;
-  auto r5 = collect(3).run(handler<Ask>([&](Ask, auto r) {
-                             ++ask_count;
-                             r("x");
-                           }),
-                           handler<Log>([&](Log e, auto r) {
-                             log_msgs.push_back(e.message);
-                             r({});
-                           }));
+  auto r5 = collect(3).run(CountingAsk{.count = ask_count, .reply = "x"},
+                           RecordLog{.msgs = log_msgs});
   assert(r5.size() == 3);
   assert(ask_count == 3);
   assert(log_msgs.size() == 4); // 3 "asking" + 1 "done"
@@ -95,19 +113,15 @@ int main() {
             << " log entries\n";
 
   // 6. Fail — handler resumes with a fallback value.
-  auto ok = safe_div(10, 2).run(handler<Fail>([](Fail, auto r) { r(-1); }));
-  auto bad = safe_div(10, 0).run(handler<Fail>([](Fail, auto r) { r(-1); }));
+  auto ok = safe_div(10, 2).run(FallbackFail{.fallback = -1});
+  auto bad = safe_div(10, 0).run(FallbackFail{.fallback = -1});
   assert(ok == 5);
   assert(bad == -1);
   std::cout << "6. safe_div: 10/2=" << ok << ", 10/0=" << bad << "\n";
 
   // 7. Different Fail handlers — same computation, different recovery policy.
-  auto zero_fallback =
-      safe_div(10, 0).run(handler<Fail>([](Fail, auto r) { r(0); }));
-  auto print_fallback = safe_div(10, 0).run(handler<Fail>([](Fail e, auto r) {
-    std::cout << "   [warn] " << e.reason << "\n";
-    r(99);
-  }));
+  auto zero_fallback = safe_div(10, 0).run(FallbackFail{.fallback = 0});
+  auto print_fallback = safe_div(10, 0).run(VerboseFail{.fallback = 99});
   assert(zero_fallback == 0);
   assert(print_fallback == 99);
   std::cout << "7. swapped Fail handler: 0-fallback=" << zero_fallback

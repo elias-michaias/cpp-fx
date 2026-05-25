@@ -41,12 +41,17 @@ static auto ping_d8() -> Ping::Fx<int> {
 [[gnu::noinline]] static int direct_d5() { return direct_d4(); }
 [[gnu::noinline]] static int direct_d8() { return direct_d5() + direct_d3(); }
 
+// ---- Handler ----------------------------------------------------------------
+
+struct PingHandler : Ping::Handler<PingHandler> {
+  void handle(Ping, auto r) { r(1); }
+};
+VALIDATE_HANDLER(PingHandler);
+
 // ---- main ------------------------------------------------------------------
 
 int main() {
   constexpr std::size_t N = 500'000;
-
-  auto h = handler<Ping>([](Ping, auto r) { r(1); });
 
   section("b5: propagation chain depth scaling  (N=" + std::to_string(N) +
           " per cell)");
@@ -59,7 +64,7 @@ int main() {
   {
     long long sink = 0;
     print_result(bench("    direct", N, [&] { sink += direct_d1(); }));
-    print_result(bench("    fx",     N, [&] { sink += ping_d1().run(h); }));
+    print_result(bench("    fx",     N, [&] { sink += ping_d1().run(PingHandler{}); }));
     do_not_optimize(sink);
   }
 
@@ -67,7 +72,7 @@ int main() {
   {
     long long sink = 0;
     print_result(bench("    direct", N, [&] { sink += direct_d3(); }));
-    print_result(bench("    fx",     N, [&] { sink += ping_d3().run(h); }));
+    print_result(bench("    fx",     N, [&] { sink += ping_d3().run(PingHandler{}); }));
     do_not_optimize(sink);
   }
 
@@ -75,7 +80,7 @@ int main() {
   {
     long long sink = 0;
     print_result(bench("    direct", N, [&] { sink += direct_d5(); }));
-    print_result(bench("    fx",     N, [&] { sink += ping_d5().run(h); }));
+    print_result(bench("    fx",     N, [&] { sink += ping_d5().run(PingHandler{}); }));
     do_not_optimize(sink);
   }
 
@@ -83,7 +88,7 @@ int main() {
   {
     long long sink = 0;
     print_result(bench("    direct", N, [&] { sink += direct_d8(); }));
-    print_result(bench("    fx",     N, [&] { sink += ping_d8().run(h); }));
+    print_result(bench("    fx",     N, [&] { sink += ping_d8().run(PingHandler{}); }));
     do_not_optimize(sink);
   }
 

@@ -48,6 +48,11 @@ struct StdoutLog : Log::Handler<StdoutLog> {
 };
 VALIDATE_HANDLER(StdoutLog);
 
+struct SilentLog : Log::Handler<SilentLog> {
+  void handle(Log, auto r) { r({}); }
+};
+VALIDATE_HANDLER(SilentLog);
+
 struct WarnFail : Fail::Handler<WarnFail> {
   void handle(Fail e, auto r) {
     std::cout << "[fail] " << e.reason << " -> -1\n";
@@ -55,3 +60,17 @@ struct WarnFail : Fail::Handler<WarnFail> {
   }
 };
 VALIDATE_HANDLER(WarnFail);
+
+struct FallbackFail : Fail::Handler<FallbackFail> {
+  int fallback;
+  void handle(Fail, auto r) { r(fallback); }
+};
+VALIDATE_HANDLER(FallbackFail);
+
+// Cycles through a scripted list of answers, repeating from the start.
+struct ScriptedAskCycling : Ask::Handler<ScriptedAskCycling> {
+  std::vector<std::string> answers;
+  int idx = 0;
+  void handle(Ask, auto r) { r(answers[idx++ % (int)answers.size()]); }
+};
+VALIDATE_HANDLER(ScriptedAskCycling);

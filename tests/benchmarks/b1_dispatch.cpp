@@ -30,6 +30,11 @@ struct Increment : Effect<Increment> {
   int value;
 };
 
+struct IncrementHandler : Increment::Handler<IncrementHandler> {
+  void handle(Increment e, auto r) { r(e.value + 1); }
+};
+VALIDATE_HANDLER(IncrementHandler);
+
 // ---- baselines -------------------------------------------------------------
 
 [[gnu::noinline]] static int direct_inc(int x) { return x + 1; }
@@ -81,12 +86,11 @@ int main() {
     do_not_optimize(sink);
   }
 
-  // 4. fx::perform — one perform per Fx computation (new frame each iter)
+  // 4. fx::perform — named handler struct, one perform per Fx computation
   {
-    auto h = handler<Increment>([](Increment e, auto r) { r(e.value + 1); });
     int sink = 0;
     print_result(bench("fx::perform (1 perform / coroutine)", N,
-                       [&] { sink = fx_inc(sink).run(h); }));
+                       [&] { sink = fx_inc(sink).run(IncrementHandler{}); }));
     do_not_optimize(sink);
   }
 

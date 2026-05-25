@@ -96,9 +96,8 @@ static void run_trio(const char *label, const std::vector<Pair> &pairs,
   }));
   do_not_optimize(sink);
 
-  auto fail_h = handler<Fail>([](Fail, auto r) { r(-1); });
   print_result(bench("  Fail effect", reps, [&] {
-    sink += eff_sum(pairs).run(fail_h);
+    sink += eff_sum(pairs).run(FallbackFail{.fallback = -1});
   }));
   do_not_optimize(sink);
   std::cout << "\n";

@@ -3,7 +3,7 @@
 // When a coroutine co_awaits an inner Fx, every effect performed by the
 // inner computation becomes visible in the outer function's return type.
 // The outer function does not handle those effects — it merely declares
-// them and autos them reach the top-level .run() call.
+// them and lets them reach the top-level .run() call.
 //
 // Call chain used here:
 //   ask_number          : Ask::Fx<int>
@@ -15,7 +15,6 @@
 #include "common.hpp"
 
 #include <cassert>
-#include <memory>
 
 // ---- Three-level call chain ------------------------------------------------
 
@@ -52,76 +51,97 @@ auto compute_ratio() -> All::Fx<std::string> {
       std::to_string(q);
 }
 
+// ---- Local handler structs -------------------------------------------------
+
+// Records Ask prompts via reference; replies with a fixed value.
+struct RecordAsk : Ask::Handler<RecordAsk> {
+  std::vector<std::string> &prompts;
+  std::string reply;
+  void handle(Ask e, auto r) { prompts.push_back(e.prompt); r(reply); }
+};
+VALIDATE_HANDLER(RecordAsk);
+
+// Records log messages via reference.
+struct RecordLog : Log::Handler<RecordLog> {
+  std::vector<std::string> &msgs;
+  void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
+};
+VALIDATE_HANDLER(RecordLog);
+
+// Records the Fail reason and resumes with fallback.
+struct RecordingFail : Fail::Handler<RecordingFail> {
+  std::string &reason;
+  int fallback;
+  void handle(Fail e, auto r) { reason = e.reason; r(fallback); }
+};
+VALIDATE_HANDLER(RecordingFail);
+
+// Counting handlers for effect-fire counting.
+struct CountAsk : Ask::Handler<CountAsk> {
+  int &count;
+  std::string reply;
+  void handle(Ask, auto r) { ++count; r(reply); }
+};
+VALIDATE_HANDLER(CountAsk);
+
+struct CountLog : Log::Handler<CountLog> {
+  int &count;
+  void handle(Log, auto r) { ++count; r({}); }
+};
+VALIDATE_HANDLER(CountLog);
+
+struct CountFail : Fail::Handler<CountFail> {
+  int &count;
+  int fallback;
+  void handle(Fail, auto r) { ++count; r(fallback); }
+};
+VALIDATE_HANDLER(CountFail);
+
 // ---- Tests -----------------------------------------------------------------
 
 int main() {
-  // Helper: scripted Ask responder cycling through the given answers.
-  auto scripted_ask = [](std::vector<std::string> answers) {
-    auto idx = std::make_shared<int>(0);
-    return handler<Ask>([answers, idx](Ask, auto r) { r(answers[(*idx)++]); });
-  };
-  auto silent_log = handler<Log>([](Log, auto r) { r({}); });
-  auto fail_neg1 = handler<Fail>([](Fail, auto r) { r(-1); });
-
   // 1. Happy path: effects from all three levels handled at the top.
-  auto r1 =
-      compute_ratio().run(scripted_ask({"12", "4"}), silent_log, fail_neg1);
+  auto r1 = compute_ratio().run(ScriptedAskCycling{.answers = {"12", "4"}},
+                                SilentLog{}, FallbackFail{.fallback = -1});
   assert(r1 == "12/4 = 3");
   std::cout << "1. happy path: " << r1 << "\n";
 
   // 2. Fail fires inside safe_div (level 1) and propagates up two levels
   //    before the top-level handler catches it.
   std::string caught_reason;
-  auto r2 = compute_ratio().run(scripted_ask({"6", "0"}), silent_log,
-                                handler<Fail>([&](Fail e, auto r) {
-                                  caught_reason = e.reason;
-                                  r(-1);
-                                }));
+  auto r2 =
+      compute_ratio().run(ScriptedAskCycling{.answers = {"6", "0"}},
+                          SilentLog{},
+                          RecordingFail{.reason = caught_reason, .fallback = -1});
   assert(caught_reason == "division by zero");
   std::cout << "2. fail propagated: " << caught_reason << "\n";
 
   // 3. Transcript capture — record every Ask prompt and Log message.
   //    The computation is unchanged; only the handlers differ.
   std::vector<std::string> prompts, log_entries;
-  compute_ratio().run(handler<Ask>([&](Ask e, auto r) {
-                        prompts.push_back(e.prompt);
-                        r("1"); // answer with "1" so stoi succeeds
-                      }),
-                      handler<Log>([&](Log e, auto r) {
-                        log_entries.push_back(e.message);
-                        r({});
-                      }),
-                      fail_neg1);
+  compute_ratio().run(RecordAsk{.prompts = prompts, .reply = "1"},
+                      RecordLog{.msgs = log_entries},
+                      FallbackFail{.fallback = -1});
   assert(prompts.size() == 2);
   assert(log_entries.size() == 2); // one in logged_div before + one after
   std::cout << "3. transcript: " << prompts.size() << " prompts, "
             << log_entries.size() << " log entries\n";
 
   // 4. Pure replay — deterministic test with no I/O.  Running the same
-  //    computation twice with different scripted inputs gives different
-  //    results.
-  auto r4a =
-      compute_ratio().run(scripted_ask({"10", "2"}), silent_log, fail_neg1);
-  auto r4b =
-      compute_ratio().run(scripted_ask({"7", "7"}), silent_log, fail_neg1);
+  //    computation twice with different scripted inputs gives different results.
+  auto r4a = compute_ratio().run(ScriptedAskCycling{.answers = {"10", "2"}},
+                                 SilentLog{}, FallbackFail{.fallback = -1});
+  auto r4b = compute_ratio().run(ScriptedAskCycling{.answers = {"7", "7"}},
+                                 SilentLog{}, FallbackFail{.fallback = -1});
   assert(r4a == "10/2 = 5");
   assert(r4b == "7/7 = 1");
   std::cout << "4. replay A: " << r4a << ", replay B: " << r4b << "\n";
 
   // 5. Counting handler — count how many times each effect fires.
   int ask_fires = 0, log_fires = 0, fail_fires = 0;
-  compute_ratio().run(handler<Ask>([&](Ask, auto r) {
-                        ++ask_fires;
-                        r("0");
-                      }),
-                      handler<Log>([&](Log, auto r) {
-                        ++log_fires;
-                        r({});
-                      }),
-                      handler<Fail>([&](Fail, auto r) {
-                        ++fail_fires;
-                        r(-1);
-                      }));
+  compute_ratio().run(CountAsk{.count = ask_fires, .reply = "0"},
+                      CountLog{.count = log_fires},
+                      CountFail{.count = fail_fires, .fallback = -1});
   assert(ask_fires == 2);  // numerator + denominator
   assert(log_fires == 2);  // before + after logged_div
   assert(fail_fires == 1); // division by zero (denominator was "0")

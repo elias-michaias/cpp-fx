@@ -6,7 +6,7 @@
 //  Effect<Self>     -- CRTP base; gives Self::Fx<R> and Self::Handler<Derived>
 //                      Use: struct MyEff : Effect<MyEff> { using result_type =
 //                      T; };
-//  Handler H        -- callable  (E, fx::Resume<E>) -> void
+//  Handler H        -- struct with handle(E, fx::Resume<E>) -> void
 //                      Resume<E> is a lightweight resume token; r(value)
 //                      resumes the suspended perform.  Use `auto r` in the
 //                      signature.
@@ -17,26 +17,22 @@
 //                              Row<IO, Fail>  flattens to Row<Ask, Log, Fail>
 //  Fx<T>                    -- pure computation, no effects (zero-arg .run())
 //  perform(e)               -- co_await an effect inside an Fx
-//  handle<E>(comp, h)       -- install h for E; returns Fx with E removed
-//                              compile error if E is not in comp's declared
-//                              effects
 //  comp.run(h1, h2, ...)    -- validate ALL declared effects are handled, run
 //                              compile error if any declared effect lacks a
 //                              handler
+//  comp.bind(h1, h2, ...)   -- pre-bind handlers; returns BoundFx<Fx, Hs...>
+//                              BoundFx::run(remaining...) fills the rest
+//                              BoundFx::bind(more...) adds further handlers
 
-//  handler<E>(lambda)       -- wrap a lambda as a single-effect TypedHandler
-//  handler<Row>(l1, l2, ...) -- build an inline CompositeHandler for a Row
 //  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is
 #include <any>
 #include <coroutine>
 #include <exception>
-#include <functional>
 #include <memory_resource>
 #include <optional>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include <variant>
 
 namespace fx {
 
@@ -90,9 +86,11 @@ template <Effectful E> struct Resume {
 /// parameter continue to work unchanged.
 template <Effectful E, typename T> struct Cont : Resume<E> {
   /// Transform fn: takes (ctx, std::any&&) and returns T.
-  /// The std::any carries the final result after all inner on_returns are applied.
+  /// The std::any carries the final result after all inner on_returns are
+  /// applied.
   using transform_fn_t = T (*)(void *, std::any &&);
-  /// Extract fn: pulls RawT out of the promise's result_ptr and boxes it as std::any.
+  /// Extract fn: pulls RawT out of the promise's result_ptr and boxes it as
+  /// std::any.
   using extract_fn_t = std::any (*)(void *);
 
   explicit Cont(PerformAwaitable<E> *pa) noexcept
@@ -101,8 +99,7 @@ template <Effectful E, typename T> struct Cont : Resume<E> {
 
   /// Koka-semantics constructor: fires on_return inside resume() in FIFO order.
   explicit Cont(PerformAwaitable<E> *pa, transform_fn_t fn, void *ctx,
-                extract_fn_t ext_fn,
-                detail::HandlerNode *own_node) noexcept
+                extract_fn_t ext_fn, detail::HandlerNode *own_node) noexcept
       : Resume<E>{pa}, transform_fn_{fn}, transform_ctx_{ctx},
         extract_fn_{ext_fn}, own_node_{own_node} {}
 
@@ -129,43 +126,13 @@ concept HandlerFor =
 
 /// Satisfied by handler objects that advertise their target effect via
 /// an `effect_type` alias (produced by `Effect::Handler<Derived>` or
-/// `handler<E>(lambda)`).  Used by `run_impl` to dispatch single-effect
+/// satisfies `TypedHandler`.  Used by `run_impl` to dispatch single-effect
 /// handlers without ambiguity with composite handlers.
 template <typename H>
 concept TypedHandler =
     requires { typename std::remove_cvref_t<H>::effect_type; } &&
     HandlerFor<std::remove_cvref_t<H>,
                typename std::remove_cvref_t<H>::effect_type>;
-
-// --- handler<E>(lambda) wrapper ---------------------------------------------
-
-/// Thin wrapper that gives an arbitrary lambda an `effect_type` alias so it
-/// satisfies `TypedHandler`.  Constructed by `handler<E>(lambda)` — prefer
-/// that helper over constructing this directly.
-// Lambdas and other raw callables satisfy this when they accept (E, auto r).
-// Used to constrain LambdaHandler<E, F> and handler<E>(fn).
-template <typename F, typename E>
-concept LambdaHandlerFor =
-    Effectful<E> &&
-    requires(std::decay_t<F> &f, E e, Cont<E, int> r) { f(e, r); };
-
-template <Effectful E, typename F>
-  requires LambdaHandlerFor<F, E>
-struct LambdaHandler {
-  using effect_type = E;
-  F fn;
-  void handle(E e, auto r) { fn(std::move(e), std::move(r)); }
-};
-
-/// Wraps `fn` in a `LambdaHandler<E>` so it can be passed to `.run()`.
-///
-///   auto h = handler<Ask>([](Ask e, auto r) { r("Alice"); });
-///   greet().run(h);
-template <Effectful E, typename F>
-  requires LambdaHandlerFor<F, E>
-auto handler(F &&fn) {
-  return LambdaHandler<E, std::decay_t<F>>{std::forward<F>(fn)};
-}
 
 // --- Thread-local handler stack and allocator --------------------------------
 
@@ -297,6 +264,29 @@ inline constexpr bool all_in_v = false;
 template <typename... InnerEs, typename... OuterEs>
 inline constexpr bool all_in_v<type_list<InnerEs...>, OuterEs...> =
     (... && contains_v<InnerEs, OuterEs...>);
+
+// True if all effects in L1 appear in L2 (both are type_lists).
+template <typename L1, typename L2>
+inline constexpr bool all_in_list_v = false;
+template <typename... InnerEs, typename... OuterEs>
+inline constexpr bool all_in_list_v<type_list<InnerEs...>, type_list<OuterEs...>> =
+    (... && contains_v<InnerEs, OuterEs...>);
+
+// remaining_effects: removes from EsList all effects covered by any handler
+// in Hs...  Used by BoundFx to compute the effect_list of the bound result.
+template <typename EsList, typename... Hs> struct remaining_effects_impl;
+template <typename... Hs>
+struct remaining_effects_impl<type_list<>, Hs...> { using type = type_list<>; };
+template <typename E, typename... Es, typename... Hs>
+struct remaining_effects_impl<type_list<E, Es...>, Hs...> {
+  static constexpr bool covered = effect_is_handled_v<E, Hs...>;
+  using tail = typename remaining_effects_impl<type_list<Es...>, Hs...>::type;
+  using type = std::conditional_t<covered, tail,
+                                  typename prepend_list<E, tail>::type>;
+};
+template <typename EsList, typename... Hs>
+using remaining_effects_t =
+    typename remaining_effects_impl<EsList, Hs...>::type;
 
 // --- Row flattening helpers -------------------------------------------------
 
@@ -506,20 +496,22 @@ template <typename... Es> struct PromiseBase : PromiseAbortBase {
   template <Effectful Eff>
   PerformAwaitable<Eff> await_transform(PerformAwaitable<Eff>) = delete;
 
-  // Inner Fx propagation — all inner effects are declared here, so allowed.
-  template <typename T2, Effectful... InnerEs>
-    requires all_in_v<type_list<InnerEs...>, Es...>
-  FxAwaitable<Fx<T2, InnerEs...>>
-  await_transform(Fx<T2, InnerEs...> inner) noexcept {
+  // Inner Fx / BoundFx propagation — works for any type with value_type and
+  // effect_list (Fx<T2,InnerEs...>, BoundFx<F,Hs...>, etc.).
+  // All inner effects must be declared in this coroutine's effect list.
+  template <typename F>
+    requires requires { typename F::value_type; typename F::effect_list; } &&
+             all_in_list_v<typename F::effect_list, type_list<Es...>>
+  FxAwaitable<F> await_transform(F inner) noexcept {
     return {std::move(inner)};
   }
 
-  // Inner Fx has undeclared effects — deleted for IDE squiggles at co_await
-  // site. To fix: add the missing effect(s) to the return type: Row<...,
-  // E>::Fx<T>.
-  template <typename T2, Effectful... InnerEs>
-    requires(!all_in_v<type_list<InnerEs...>, Es...>)
-  FxAwaitable<Fx<T2, InnerEs...>> await_transform(Fx<T2, InnerEs...>) = delete;
+  // Inner computation has undeclared effects — deleted for IDE squiggles.
+  // To fix: add the missing effect(s) to the return type: Row<..., E>::Fx<T>.
+  template <typename F>
+    requires requires { typename F::value_type; typename F::effect_list; } &&
+             (!all_in_list_v<typename F::effect_list, type_list<Es...>>)
+  FxAwaitable<F> await_transform(F) = delete;
 };
 
 // RAII coroutine handle — owns the handle and destroys it on scope exit.
@@ -562,8 +554,7 @@ std::any on_return_any_impl(void *ctx, std::any &&val) {
 
 /// Extracts the RawT value from the promise's result_ptr (an optional<RawT>*)
 /// and returns it boxed as std::any.
-template <typename RawT>
-std::any extract_result_impl(void *result_ptr) {
+template <typename RawT> std::any extract_result_impl(void *result_ptr) {
   auto &opt = *static_cast<std::optional<RawT> *>(result_ptr);
   return std::any(std::move(*opt));
 }
@@ -572,7 +563,7 @@ std::any extract_result_impl(void *result_ptr) {
 /// Returns on_return_t<H, InnerR>.  Used as the Cont::transform_fn_.
 template <typename H, typename InnerR>
 on_return_t<std::remove_cvref_t<H>, InnerR> apply_on_return(void *ctx,
-                                                             std::any &&val) {
+                                                            std::any &&val) {
   using Hb = std::remove_cvref_t<H>;
   return static_cast<Hb *>(ctx)->on_return(
       std::any_cast<InnerR>(std::move(val)));
@@ -586,7 +577,7 @@ on_return_t<std::remove_cvref_t<H>, InnerR> apply_on_return(void *ctx,
 /// When non-void (set by run_push for TypedHandlers), the dispatch lambda
 /// passes a `Cont<E, ResultT>` so the handler's template operator()
 /// can deduce T without an explicit template argument.
-/// Composite handlers and handle<E>() use the default `void`, which falls
+/// Composite handlers use the default `void`, which falls
 /// back to passing the plain `Resume<E>` (no driving-operator support needed).
 template <Effectful E, typename H, typename ResultT = void,
           typename RawT = ResultT>
@@ -618,7 +609,7 @@ struct ScopedHandler {
       auto *pa = reinterpret_cast<PerformAwaitable<E> *>(raw);
 
       if constexpr (std::is_void_v<ResultT>) {
-        // Composite / handle<E>() path — pass plain Resume<E>.
+        // Composite / BoundFx path — pass plain Resume<E>.
         using Token = Resume<E>;
         using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
         if constexpr (std::is_void_v<Ret>) {
@@ -647,8 +638,8 @@ struct ScopedHandler {
         } else {
           auto val = hh.handle(pa->effect_,
                                Token{pa, &detail::apply_on_return<Hb, ResultT>,
-                                    static_cast<void *>(&hh),
-                                    &detail::extract_result_impl<RawT>, n});
+                                     static_cast<void *>(&hh),
+                                     &detail::extract_result_impl<RawT>, n});
           pa->abort_base_->aborted = true;
           pa->abort_base_->abort_owner = n->handler_obj;
           pa->abort_base_->abort_value = std::any(std::move(val));
@@ -737,25 +728,17 @@ public:
 
 private:
   using OwnedHandle = detail::OwnedHandle<promise_type>;
+  OwnedHandle impl_;
 
-  using Fn = std::move_only_function<T()>;
-  using Impl = std::variant<OwnedHandle, Fn>;
-  Impl impl_;
-
-  // Access the non-templated abort slot in the promise (null for Fn variant).
   detail::PromiseAbortBase *get_abort_base() noexcept {
-    if (auto *oh = std::get_if<OwnedHandle>(&impl_))
-      return &oh->h.promise();
-    return nullptr;
+    return &impl_.h.promise();
   }
 
   // Base: all handlers pushed; drive the coroutine.
   // Returns nullopt if a handler aborted (coroutine left suspended +
   // destroyed).
   std::optional<T> run_push() {
-    if (auto *fn = std::get_if<Fn>(&impl_))
-      return (*fn)();
-    auto &h = std::get<OwnedHandle>(impl_).h;
+    auto &h = impl_.h;
     h.resume();
     while (!h.done()) {
       auto &p = h.promise();
@@ -876,26 +859,9 @@ private:
 
 public:
   explicit Fx(Handle h) noexcept : impl_(OwnedHandle{h}) {}
-  explicit Fx(Fn fn) : impl_(std::move(fn)) {}
   Fx(Fx &&) noexcept = default;
   Fx(const Fx &) = delete;
   Fx &operator=(const Fx &) = delete;
-
-  /// Execute with handler types as template parameters (default-constructs
-  /// each handler).  Compile error if any declared effect is unhandled.
-  template <typename... Hs>
-    requires detail::all_handled_v<detail::type_list<Es...>, Hs...> &&
-             (std::default_initializable<Hs> && ...)
-  auto run() {
-    std::tuple<Hs...> locals{};
-    return *std::apply([this](auto &...hs) { return run_push(hs...); }, locals);
-  }
-
-  /// @cond — deleted fallback for run<Hs...>() when coverage is incomplete.
-  template <typename... Hs>
-    requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
-  auto run() = delete;
-  /// @endcond
 
   /// Execute with handler instances.  Compile error if any effect is unhandled.
   template <typename... Hs>
@@ -912,12 +878,15 @@ public:
   auto run(Hs &&...) = delete;
   /// @endcond
 
-  // Used by FxAwaitable (co_await inner_fx) and handle<E>().
+  /// Pre-bind handlers, returning a BoundFx that owns both the computation
+  /// and the handlers.  Call .run(remaining...) or .bind(more...) on it.
+  template <typename... Hs>
+  auto bind(Hs &&...hs);
+
+  // Used by FxAwaitable (co_await inner_fx inside another coroutine).
   // Runs without abort support — abort handlers must be outermost.
   T _run() {
-    if (auto *fn = std::get_if<Fn>(&impl_))
-      return (*fn)();
-    auto &h = std::get<OwnedHandle>(impl_).h;
+    auto &h = impl_.h;
     h.resume();
     while (!h.done()) {
       auto &p = h.promise();
@@ -950,10 +919,7 @@ public:
 
 private:
   using OwnedHandle = detail::OwnedHandle<promise_type>;
-
-  using Fn = std::move_only_function<void()>;
-  using Impl = std::variant<OwnedHandle, Fn>;
-  Impl impl_;
+  OwnedHandle impl_;
 
   void run_push() { _run(); }
 
@@ -986,26 +952,9 @@ private:
 
 public:
   explicit Fx(Handle h) noexcept : impl_(OwnedHandle{h}) {}
-  explicit Fx(Fn fn) : impl_(std::move(fn)) {}
   Fx(Fx &&) noexcept = default;
   Fx(const Fx &) = delete;
   Fx &operator=(const Fx &) = delete;
-
-  /// Execute with handler types as template parameters (default-constructs
-  /// each).
-  template <typename... Hs>
-    requires detail::all_handled_v<detail::type_list<Es...>, Hs...> &&
-             (std::default_initializable<Hs> && ...)
-  void run() {
-    std::tuple<Hs...> locals{};
-    std::apply([this](auto &...hs) { run_push(hs...); }, locals);
-  }
-
-  /// @cond deleted fallback for run<Hs...>() when coverage is incomplete.
-  template <typename... Hs>
-    requires(!detail::all_handled_v<detail::type_list<Es...>, Hs...>)
-  void run() = delete;
-  /// @endcond
 
   /// Execute with handler instances.
   template <typename... Hs>
@@ -1021,12 +970,13 @@ public:
   void run(Hs &&...) = delete;
   /// @endcond
 
+  /// Pre-bind handlers, returning a BoundFx that owns both the computation
+  /// and the handlers.  Call .run(remaining...) or .bind(more...) on it.
+  template <typename... Hs>
+  auto bind(Hs &&...hs);
+
   void _run() {
-    if (auto *fn = std::get_if<Fn>(&impl_)) {
-      (*fn)();
-      return;
-    }
-    auto &h = std::get<OwnedHandle>(impl_).h;
+    auto &h = impl_.h;
     h.resume();
     while (!h.done()) {
       auto &p = h.promise();
@@ -1044,30 +994,111 @@ Fx<void, Es...> Fx<void, Es...>::promise_type::get_return_object() noexcept {
   return Fx{Handle::from_promise(*this)};
 }
 
-// --- AnyFx concept ----------------------------------------------------------
+// --- BoundFx ----------------------------------------------------------------
 
-/// Matches any `Fx<T, Es...>` specialisation via structural detection.
-/// Used internally to constrain `handle<E>` and `remove_effect_t`.
-template <typename F>
-concept AnyFx = requires {
-  typename F::value_type;
-  typename F::effect_list;
+/// A computation with some handlers pre-bound.
+/// Produced by `Fx::bind(hs...)` or `BoundFx::bind(more...)`.
+/// Zero-overhead: no type erasure, no variant — handlers sit in a tuple.
+///
+/// `.run(remaining_hs...)` — all unhandled effects must be covered by
+///   remaining_hs + pre-bound handlers together; delegates to the inner Fx.
+/// `.bind(more_hs...)` — returns a new BoundFx with additional pre-bound
+///   handlers (tuple is concatenated, inner Fx is moved).
+/// `._run()` — used by `co_await bound_fx` inside another coroutine; pushes
+///   pre-bound handlers onto the thread-local stack and drives inner Fx.
+template <typename InnerFx, typename... PreHs>
+class BoundFx {
+  InnerFx fx_;
+  std::tuple<PreHs...> pre_;
+
+  // Recursive helper: push pre-bound handlers one by one, then run inner.
+  template <std::size_t I>
+  typename InnerFx::value_type _push_and_run() {
+    if constexpr (I == sizeof...(PreHs)) {
+      return fx_._run();
+    } else {
+      using H = std::remove_cvref_t<std::tuple_element_t<I, std::tuple<PreHs...>>>;
+      auto &h = std::get<I>(pre_);
+      if constexpr (TypedHandler<H> && !CompositeHandler<H>) {
+        ScopedHandler<typename H::effect_type, H> guard{h};
+        return _push_and_run<I + 1>();
+      } else {
+        return _push_composite_and_run<I>(h, typename H::effect_types{});
+      }
+    }
+  }
+
+  template <std::size_t I, Effectful First, Effectful... Rem>
+  typename InnerFx::value_type
+  _push_composite_and_run(auto &h, detail::type_list<First, Rem...>) {
+    ScopedHandler<First, std::remove_cvref_t<decltype(h)>> guard{h};
+    return _push_composite_and_run<I>(h, detail::type_list<Rem...>{});
+  }
+
+  template <std::size_t I>
+  typename InnerFx::value_type _push_composite_and_run(auto &,
+                                                       detail::type_list<>) {
+    return _push_and_run<I + 1>();
+  }
+
+public:
+  using value_type = typename InnerFx::value_type;
+  using effect_list =
+      detail::remaining_effects_t<typename InnerFx::effect_list, PreHs...>;
+
+  BoundFx(InnerFx fx, std::tuple<PreHs...> pre)
+      : fx_(std::move(fx)), pre_(std::move(pre)) {}
+
+  BoundFx(BoundFx &&) noexcept = default;
+  BoundFx(const BoundFx &) = delete;
+  BoundFx &operator=(const BoundFx &) = delete;
+
+  /// Execute with additional handler instances for any remaining effects.
+  template <typename... Hs>
+    requires detail::all_handled_v<typename InnerFx::effect_list, PreHs...,
+                                   Hs...>
+  auto run(Hs &&...hs) {
+    return std::apply(
+        [&, this](auto &...pre) {
+          return fx_.run(pre..., std::forward<Hs>(hs)...);
+        },
+        pre_);
+  }
+
+  /// @cond — deleted fallback when remaining effects are not covered.
+  template <typename... Hs>
+    requires(!detail::all_handled_v<typename InnerFx::effect_list, PreHs...,
+                                    Hs...>)
+  auto run(Hs &&...) = delete;
+  /// @endcond
+
+  /// Append more pre-bound handlers; returns a new BoundFx.
+  template <typename... MoreHs>
+  auto bind(MoreHs &&...more) {
+    return BoundFx<InnerFx, PreHs..., std::decay_t<MoreHs>...>{
+        std::move(fx_),
+        std::tuple_cat(std::move(pre_),
+                       std::make_tuple(std::forward<MoreHs>(more)...))};
+  }
+
+  /// Used by `co_await bound_fx` inside another coroutine.
+  typename InnerFx::value_type _run() { return _push_and_run<0>(); }
 };
 
-/// Satisfied when effect `E` is listed in `F`'s declared effect set.
-/// Used to constrain `handle<E>()` — when violated, the concept name itself
-/// describes the problem: "E is not declared in this computation's type."
-template <typename E, typename F>
-concept DeclaredIn = Effectful<E> && AnyFx<F> &&
-                     detail::contains_in_list_v<E, typename F::effect_list>;
+// Out-of-line definitions of Fx::bind() (BoundFx must be complete first).
+template <typename T, Effectful... Es>
+template <typename... Hs>
+auto Fx<T, Es...>::bind(Hs &&...hs) {
+  return BoundFx<Fx<T, Es...>, std::decay_t<Hs>...>{
+      std::move(*this), std::make_tuple(std::forward<Hs>(hs)...)};
+}
 
-namespace detail {
-// Given Fx<T, E1, E2, E3> and E to remove → Fx<T, E1, E3>.
-template <Effectful E, AnyFx F>
-using remove_effect_from_fx_t =
-    fx_from_list_t<typename F::value_type,
-                   typename remove_from_list<E, typename F::effect_list>::type>;
-} // namespace detail
+template <Effectful... Es>
+template <typename... Hs>
+auto Fx<void, Es...>::bind(Hs &&...hs) {
+  return BoundFx<Fx<void, Es...>, std::decay_t<Hs>...>{
+      std::move(*this), std::make_tuple(std::forward<Hs>(hs)...)};
+}
 
 // --- perform(e) -------------------------------------------------------------
 
@@ -1192,32 +1223,6 @@ template <Effectful E> auto perform_impl(E e) {
 }
 } // namespace detail
 
-// --- handle<E>(comp, h) -----------------------------------------------------
-
-/// Partially handles effect `E` inside `comp`, returning a new `Fx` with
-/// `E` removed from the effect list.  The returned computation is lazy —
-/// `h` is not invoked until `.run()` (or another `handle`) is called.
-///
-/// Compile error (`DeclaredIn` constraint) if `E` is not declared in
-/// `comp`'s effect list.
-///
-///   // Fail::Fx<int>  →  Fx<int>  (no remaining effects)
-///   auto result = handle<Fail>(safe_div(10, 0),
-///                   handler<Fail>([](Fail, auto r) { r(-1); }))
-///                 .run();
-template <Effectful E, AnyFx F, typename H>
-  requires HandlerFor<H, E> && DeclaredIn<E, F>
-auto handle(F comp, H h) -> detail::remove_effect_from_fx_t<E, F> {
-  using RetFx = detail::remove_effect_from_fx_t<E, F>;
-  using Hb = std::remove_cvref_t<H>;
-  return RetFx{std::move_only_function<typename F::value_type()>{
-      [comp = std::move(comp), h = std::move(h)]() mutable {
-        Hb local_h = std::move(h);
-        ScopedHandler<E, Hb> guard{local_h};
-        return comp._run();
-      }}};
-}
-
 /// Groups several effects (or other rows) into a named row.
 ///
 /// Arguments may be bare `Effectful` types, other `Row` aliases, or a mix —
@@ -1260,68 +1265,6 @@ using row_from_list_t = typename row_from_list<List>::type;
 ///   using All = Row<IO, Fail>;   // flattens to BasicRow<Ask, Log, Fail>
 template <typename... Ts>
 using Row = detail::row_from_list_t<detail::flatten_effects_t<Ts...>>;
-
-/// Satisfied by `Row<Es...>` specialisations (and anything else that
-/// exposes an `::effects` type alias).  Used to constrain `handler<R>()`.
-template <typename R>
-concept RowType = requires { typename R::effects; };
-
-namespace detail {
-
-// True if at least one of Lambdas (raw callables) can handle effect E.
-template <typename E, typename... Lambdas>
-inline constexpr bool any_handles_v = (LambdaHandlerFor<Lambdas, E> || ...);
-
-// True if every effect in the list is handled by at least one lambda.
-template <typename EffectList, typename... Lambdas>
-inline constexpr bool all_lambda_handled_v = false;
-template <typename... Es, typename... Lambdas>
-inline constexpr bool all_lambda_handled_v<type_list<Es...>, Lambdas...> =
-    (any_handles_v<Es, Lambdas...> && ...);
-
-} // namespace detail
-
-/// Composite handler built by `handler<Row>(lambdas...)`.
-/// Satisfies `CompositeHandler` — dispatches each incoming effect to the
-/// first lambda whose call signature matches.  Prefer constructing via
-/// `handler<R>(...)` rather than directly.
-template <RowType R, typename... Lambdas> struct CompositeLambdaHandler {
-  using effect_types = typename R::effects;
-  std::tuple<Lambdas...> fns;
-
-  template <Effectful E> void handle(E e, auto r) {
-    std::apply(
-        [&](auto &...fn) {
-          (... || [&]() -> bool {
-            if constexpr (LambdaHandlerFor<std::remove_cvref_t<decltype(fn)>,
-                                           E>) {
-              fn(std::move(e), std::move(r));
-              return true;
-            }
-            return false;
-          }());
-        },
-        fns);
-  }
-};
-
-/// Builds an inline `CompositeHandler` for a `Row`, matching lambdas to
-/// effects by argument type (first matching lambda wins).
-///
-/// Compile error if any effect in `R` has no matching lambda.
-///
-///   auto h = handler<IO>(
-///     [](Ask, auto r) { r("hello"); },
-///     [](Log e, auto r) { std::cout << e.message; r({}); }
-///   );
-///   greet().run(h);
-template <RowType R, typename... Lambdas>
-  requires detail::all_lambda_handled_v<typename R::effects,
-                                        std::decay_t<Lambdas>...>
-auto handler(Lambdas &&...lambdas) {
-  return CompositeLambdaHandler<R, std::decay_t<Lambdas>...>{
-      std::make_tuple(std::forward<Lambdas>(lambdas)...)};
-}
 
 /// CRTP base for a single-effect type.
 ///

@@ -2,8 +2,7 @@
 //
 // A Row<E1, E2, ...> names a set of effects and unlocks:
 //   • Row::Fx<T>          — return type declaring all effects in the row
-//   • Row::Handler<D>     — CRTP base; D must provide operator() for every E
-//   • handler<Row>(...)   — build an inline composite from lambdas
+//   • Row::Handler<D>     — CRTP base; D must provide handle() for every E
 //   • Combine<R1, R2>     — merge two rows
 //   • VALIDATE_HANDLER(H) — static_assert that H is complete (fires at
 //                            definition time, before H is ever instantiated)
@@ -86,6 +85,23 @@ VALIDATE_HANDLER(ScriptedAll);
 
 // ---- Tests -----------------------------------------------------------------
 
+// Inline composite for tests 6-7: handles IO (Ask+Log) with reference state.
+struct CountingIO : IO::Handler<CountingIO> {
+  std::string ask_reply;
+  int &log_count;
+  void handle(Ask, auto r) { r(ask_reply); }
+  void handle(Log, auto r) { ++log_count; r({}); }
+};
+VALIDATE_HANDLER(CountingIO);
+
+struct IndexedIO : IO::Handler<IndexedIO> {
+  const char *const *inputs;
+  int &idx;
+  void handle(Ask, auto r) { r(std::string{inputs[idx++]}); }
+  void handle(Log, auto r) { r({}); }
+};
+VALIDATE_HANDLER(IndexedIO);
+
 int main() {
   // 1. Single composite struct covers Ask + Log — one argument to .run().
   auto r1 = greet().run(ScriptedIO{.answers = {"Alice"}});
@@ -113,33 +129,25 @@ int main() {
   assert(r5 == "8/0 = -1");
   std::cout << "5. ScriptedIO + WarnFail (fail path): " << r5 << "\n";
 
-  // 6. handler<IO>() — inline composite from lambdas, no struct needed.
+  // 6. Composite IO handler with reference-captured log count.
   int log_count = 0;
-  auto h6 = handler<IO>([](Ask, auto r) { r(std::string{"inline"}); },
-                        [&](Log, auto r) {
-                          ++log_count;
-                          r({});
-                        });
-  auto r6 = greet().run(h6);
+  auto r6 = greet().run(CountingIO{.ask_reply = "inline", .log_count = log_count});
   assert(r6 == "Hello, inline!");
   assert(log_count == 2);
-  std::cout << "6. handler<IO> inline: " << r6 << " (" << log_count
+  std::cout << "6. CountingIO (composite): " << r6 << " (" << log_count
             << " logs)\n";
 
-  // 7. handler<IO>(lambdas) + handler<Fail>(lambda) for All::Fx<string>.
+  // 7. Indexed IO handler + FallbackFail for All::Fx<string>.
   int ask_idx = 0;
   std::array<const char *, 2> in{"6", "3"};
-  auto io7 = handler<IO>([&](Ask, auto r) { r(std::string{in[ask_idx++]}); },
-                         [](Log, auto r) { r({}); });
-  auto fail7 = handler<Fail>([](Fail, auto r) { r(-1); });
-  auto r7 = ratio().run(io7, fail7);
+  auto r7 = ratio().run(IndexedIO{.inputs = in.data(), .idx = ask_idx},
+                        FallbackFail{.fallback = -1});
   assert(r7 == "6/3 = 2");
-  std::cout << "7. handler<IO> + handler<Fail>: " << r7 << "\n";
+  std::cout << "7. IndexedIO + FallbackFail: " << r7 << "\n";
 
   // 8. VALIDATE_HANDLER demo — the structs above all pass.
   //    See invalid/05_incomplete_handler.cpp for the compile error case.
-  std::cout
-      << "8. VALIDATE_HANDLER: ScriptedIO, ScriptedAll, WarnFail all OK\n";
+  std::cout << "8. VALIDATE_HANDLER: ScriptedIO, ScriptedAll, WarnFail all OK\n";
 
   std::cout << "All tests passed.\n";
 }

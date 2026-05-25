@@ -17,6 +17,7 @@
 #include "bench.hpp"
 
 #include <coroutine>
+#include <functional>
 #include <numeric>
 #include <vector>
 
@@ -60,6 +61,13 @@ static auto fx_range(int n) -> Emit<int>::Fx<void> {
     perform(Emit<int>{.value = i});
   co_return;
 }
+
+// ---- named handler: collects emitted ints into an output vector ------------
+
+struct CollectInts : Emit<int>::Handler<CollectInts> {
+  std::vector<int> &out;
+  void handle(Emit<int> e, auto r) { out.push_back(e.value); r({}); }
+};
 
 // ---- main ------------------------------------------------------------------
 
@@ -128,17 +136,13 @@ int main() {
     do_not_optimize(sink);
   }
 
-  // 5. Emit<int> effect (full fx machinery)
+  // 5. Emit<int> effect (full fx machinery) — named handler struct
   {
     long long sink = 0;
     print_result(bench("Emit<int> effect (fx)", REPS, [&] {
       std::vector<int> v;
       v.reserve(N);
-      fx_range(N).run(
-          handler<Emit<int>>([&](Emit<int> e, auto r) {
-            v.push_back(e.value);
-            r({});
-          }));
+      fx_range(N).run(CollectInts{.out = v});
       sink += v.back();
     }));
     do_not_optimize(sink);

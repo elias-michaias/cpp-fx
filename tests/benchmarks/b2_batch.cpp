@@ -35,6 +35,12 @@ static auto sum_ticks(int n) -> Tick::Fx<long long> {
   co_return total;
 }
 
+struct TickCounter : Tick::Handler<TickCounter> {
+  int &counter;
+  void handle(Tick, auto r) { r(++counter); }
+};
+VALIDATE_HANDLER(TickCounter);
+
 // ---- main ------------------------------------------------------------------
 
 int main() {
@@ -80,9 +86,8 @@ int main() {
   {
     long long sink = 0;
     int counter = 0;
-    auto h = handler<Tick>([&](Tick, auto r) { r(++counter); });
     fx_r = bench("fx::perform in batch coroutine", REPS, [&] {
-      sink += sum_ticks(BATCH).run(h);
+      sink += sum_ticks(BATCH).run(TickCounter{.counter = counter});
     });
     print_result(fx_r);
     do_not_optimize(sink);

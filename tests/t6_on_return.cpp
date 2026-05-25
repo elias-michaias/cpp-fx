@@ -201,6 +201,28 @@ struct ScriptedAskLog : AskLog::Handler<ScriptedAskLog> {
 };
 VALIDATE_HANDLER(ScriptedAskLog);
 
+// Reference-counting Log handler for inline test assertions.
+struct CountLog : Log::Handler<CountLog> {
+  int &count;
+  void handle(Log, auto r) { ++count; r({}); }
+};
+VALIDATE_HANDLER(CountLog);
+
+// Reference-recording Log handler (captures log messages by ref).
+struct RecordLog : Log::Handler<RecordLog> {
+  std::vector<std::string> &msgs;
+  void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
+};
+VALIDATE_HANDLER(RecordLog);
+
+// Reference-counting Ask handler with a fixed reply.
+struct CountAsk : Ask::Handler<CountAsk> {
+  int &count;
+  std::string reply;
+  void handle(Ask, auto r) { ++count; r(reply); }
+};
+VALIDATE_HANDLER(CountAsk);
+
 // ---- Tests ------------------------------------------------------------------
 
 // 1. on_return on the normal path converts int → string.
@@ -299,10 +321,7 @@ static void test_chain_three_on_returns() {
 static void test_outer_abort_skips_inner() {
   int log_count = 0;
   AskAbort<int> aa;
-  auto result = ask_then_log().run(aa, handler<Log>([&](Log, auto r) {
-                                     ++log_count;
-                                     r({});
-                                   }));
+  auto result = ask_then_log().run(aa, CountLog{.count = log_count});
   assert(result == std::nullopt);
   assert(log_count == 0); // Log was never performed
   PASS(
@@ -314,22 +333,19 @@ static void test_outer_abort_skips_inner() {
 static void test_outer_success_chain() {
   int log_count = 0;
   AskOpt<int> ao{.reply = "Hi"};
-  auto result = ask_then_log().run(ao, handler<Log>([&](Log, auto r) {
-                                     ++log_count;
-                                     r({});
-                                   }));
+  auto result = ask_then_log().run(ao, CountLog{.count = log_count});
   assert(result == std::optional{2}); // "Hi".size() == 2
   assert(log_count == 1);             // Log fired once
   PASS("8. outer success: Ask answers, Log fires, on_return wraps "
        "int→optional<int>");
 }
 
-// 9. run<H>() default-constructs the handler.
+// 9. Default-construct handler via .run(H{}).
 static void test_run_default_construct() {
   // IntToStr is default-constructible; handles Fail by resuming with 0.
-  auto r = safe_div(10, 0).run<IntToStr>();
+  auto r = safe_div(10, 0).run(IntToStr{});
   assert(r == "0");
-  PASS("9. run<H>(): default-constructs handler; on_return still applied");
+  PASS("9. run(H{}): default-constructs handler; on_return still applied");
 }
 
 // 10. Composite (Row) handler with on_return.
@@ -462,15 +478,12 @@ static void test_spy_cont_then_on_return() {
 //     state changes (e.g. captured log messages) must be observed via
 //     reference- capturing lambdas rather than struct members.
 static void test_cont_drives_resume_only_chain() {
-  // Happy path: no Fail.  Use a lambda with reference capture to observe
+  // Happy path: no Fail.  Use a reference-capture struct to observe
   // that Log was handled inside k.resume().
   {
     std::vector<std::string> captured;
-    auto log_h = handler<Log>([&](Log e, auto r) {
-      captured.push_back(e.message);
-      r({});
-    });
-    auto r = ask_log_div(10, 2).run(AnnotateCont{.given = "hi"}, log_h,
+    auto r = ask_log_div(10, 2).run(AnnotateCont{.given = "hi"},
+                                    RecordLog{.msgs = captured},
                                     RecoverFail{.fallback = -1});
     static_assert(std::is_same_v<decltype(r), std::string>);
     assert(r == "[?→hi]=5");
@@ -480,11 +493,8 @@ static void test_cont_drives_resume_only_chain() {
   // Recovery path: Fail fires, RecoverFail resumes with -1.
   {
     std::vector<std::string> captured;
-    auto log_h = handler<Log>([&](Log e, auto r) {
-      captured.push_back(e.message);
-      r({});
-    });
-    auto r = ask_log_div(10, 0).run(AnnotateCont{.given = "hi"}, log_h,
+    auto r = ask_log_div(10, 0).run(AnnotateCont{.given = "hi"},
+                                    RecordLog{.msgs = captured},
                                     RecoverFail{.fallback = -1});
     assert(r == "[?→hi]=-1");
     assert(captured.size() == 1u); // Log still fires before Fail
@@ -753,13 +763,8 @@ static void test_two_handle_on_return_compose() {
 //       Ask lambda fires once (reference-captured, observable)
 static void test_temporal_ordering_handle_before_on_return() {
   int ask_count = 0;
-  auto ask_h = handler<Ask>([&](Ask, auto r) {
-    ++ask_count;
-    r("Q");
-  });
-
-  // LogAccumulate: handle fires 3 times, on_return packages all 3 msgs with n.
-  auto [val, msgs] = ask_then_multi_log(3).run(LogAccumulate{}, ask_h);
+  auto [val, msgs] = ask_then_multi_log(3).run(LogAccumulate{},
+                                               CountAsk{.count = ask_count, .reply = "Q"});
   static_assert(std::is_same_v<decltype(val), int>);
 
   // handle × 3 then on_return × 1: on_return sees all 3 messages.

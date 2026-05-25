@@ -119,7 +119,7 @@ static constexpr std::size_t kArena = kFrameSlot + 65536;
 
 struct CountHandler : Tick::Handler<CountHandler> {
   int n = 0;
-  void operator()(Tick, auto resume) { resume(n++); }
+  void handle(Tick, auto resume) { resume(n++); }
 };
 
 // ── Inner coroutine ──────────────────────────────────────────────────────────
@@ -203,7 +203,8 @@ int main() {
 
   // ── Per-perform breakdown ────────────────────────────────────────────────
   section("Per-perform cost (÷ " + std::to_string(BATCH) + ")");
-  std::cout << "  Per-perform payload alloc: ZERO (stored in coroutine frame)\n";
+  std::cout
+      << "  Per-perform payload alloc: ZERO (stored in coroutine frame)\n";
   std::cout << "  (Divide per-coroutine ns above by " << BATCH
             << " for residual per-perform overhead.)\n";
 

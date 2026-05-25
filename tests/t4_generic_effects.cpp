@@ -6,11 +6,11 @@
 //
 // Covers:
 //   • Emit<T>::Fx<void> for value-producing coroutines
-//   • Collect into a vector via handle<Emit<T>>
+//   • Collect into a vector via .bind() with a named handler struct
 //   • Emit<int> and Emit<string> as separate, independent effects
-//   • Local absorption → pure Fx<T> (sum, collect)
+//   • Local absorption → pure BoundFx (sum, collect)
 //   • Propagation alongside other effects (Log)
-//   • Transform and filter patterns using the handler's resume callback
+//   • Transform and filter patterns using named handler structs
 
 #include "common.hpp"
 
@@ -42,25 +42,49 @@ auto range_logged(int lo, int hi) -> Row<Emit<int>, Log>::Fx<void> {
   perform(Log{.message = "done"});
 }
 
-// Absorbs Emit<int> locally and returns the sum.  Caller sees pure Fx<int>.
+// ---- Handler structs --------------------------------------------------------
+
+template <typename T>
+struct CollectEmit : Emit<T>::Handler<CollectEmit<T>> {
+  std::vector<T> &out;
+  void handle(Emit<T> e, auto r) { out.push_back(std::move(e.value)); r({}); }
+};
+
+template <typename T>
+struct SumEmit : Emit<T>::Handler<SumEmit<T>> {
+  T &total;
+  void handle(Emit<T> e, auto r) { total += e.value; r({}); }
+};
+
+struct DoubleEmit : Emit<int>::Handler<DoubleEmit> {
+  std::vector<int> &out;
+  void handle(Emit<int> e, auto r) { out.push_back(e.value * 2); r({}); }
+};
+
+struct FilterEvenEmit : Emit<int>::Handler<FilterEvenEmit> {
+  std::vector<int> &out;
+  void handle(Emit<int> e, auto r) { if (e.value % 2 == 0) out.push_back(e.value); r({}); }
+};
+
+struct CountLog : Log::Handler<CountLog> {
+  int &count;
+  void handle(Log, auto r) { ++count; r({}); }
+};
+VALIDATE_HANDLER(CountLog);
+
+// ---- Local-absorbing computations ------------------------------------------
+
+// Absorbs Emit<int> locally and returns the sum.  Caller sees pure BoundFx.
 auto sum_range(int lo, int hi) -> Fx<int> {
   int total = 0;
-  co_await handle<Emit<int>>(range(lo, hi),
-                             handler<Emit<int>>([&total](Emit<int> e, auto r) {
-                               total += e.value;
-                               r({});
-                             }));
+  co_await range(lo, hi).bind(SumEmit<int>{.total = total});
   co_return total;
 }
 
-// Absorbs Emit<int> locally into a vector.  Caller sees pure Fx<vector<int>>.
+// Absorbs Emit<int> locally into a vector.  Caller sees pure BoundFx.
 auto collect_range(int lo, int hi) -> Fx<std::vector<int>> {
   std::vector<int> out;
-  co_await handle<Emit<int>>(range(lo, hi),
-                             handler<Emit<int>>([&out](Emit<int> e, auto r) {
-                               out.push_back(e.value);
-                               r({});
-                             }));
+  co_await range(lo, hi).bind(CollectEmit<int>{.out = out});
   co_return out;
 }
 
@@ -69,10 +93,7 @@ auto collect_range(int lo, int hi) -> Fx<std::vector<int>> {
 int main() {
   // 1. Collect Emit<int> into a vector at the call site.
   std::vector<int> nums;
-  range(1, 6).run(handler<Emit<int>>([&](Emit<int> e, auto r) {
-    nums.push_back(e.value);
-    r({});
-  }));
+  range(1, 6).run(CollectEmit<int>{.out = nums});
   assert((nums == std::vector{1, 2, 3, 4, 5}));
   std::cout << "1. range [1,6):";
   for (int v : nums)
@@ -82,15 +103,8 @@ int main() {
   // 2. Emit<int> and Emit<string> are distinct effects — two handlers required.
   std::vector<int> sq_vals;
   std::vector<std::string> sq_labels;
-  squares(1, 5).run(
-      handler<Emit<int>>([&](Emit<int> e, auto r) {
-        sq_vals.push_back(e.value);
-        r({});
-      }),
-      handler<Emit<std::string>>([&](Emit<std::string> e, auto r) {
-        sq_labels.push_back(e.value);
-        r({});
-      }));
+  squares(1, 5).run(CollectEmit<int>{.out = sq_vals},
+                    CollectEmit<std::string>{.out = sq_labels});
   assert((sq_vals == std::vector{1, 4, 9, 16}));
   assert(sq_labels.size() == 4);
   std::cout << "2. squares [1,5): vals =";
@@ -116,14 +130,8 @@ int main() {
   // 5. Propagation alongside Log: both Emit<int> and Log reach the caller.
   std::vector<int> propagated;
   int log_count = 0;
-  range_logged(1, 4).run(handler<Emit<int>>([&](Emit<int> e, auto r) {
-                           propagated.push_back(e.value);
-                           r({});
-                         }),
-                         handler<Log>([&](Log, auto r) {
-                           ++log_count;
-                           r({});
-                         }));
+  range_logged(1, 4).run(CollectEmit<int>{.out = propagated},
+                         CountLog{.count = log_count});
   assert((propagated == std::vector{1, 2, 3}));
   assert(log_count == 2); // header + footer
   std::cout << "5. range_logged [1,4): " << propagated.size() << " values, "
@@ -131,10 +139,7 @@ int main() {
 
   // 6. Transform via the handler: double each emitted value.
   std::vector<int> doubled;
-  range(1, 5).run(handler<Emit<int>>([&](Emit<int> e, auto r) {
-    doubled.push_back(e.value * 2);
-    r({});
-  }));
+  range(1, 5).run(DoubleEmit{.out = doubled});
   assert((doubled == std::vector{2, 4, 6, 8}));
   std::cout << "6. transform (×2):";
   for (int v : doubled)
@@ -143,30 +148,22 @@ int main() {
 
   // 7. Filter via the handler: only keep even values.
   std::vector<int> evens;
-  range(1, 9).run(handler<Emit<int>>([&](Emit<int> e, auto r) {
-    if (e.value % 2 == 0)
-      evens.push_back(e.value);
-    r({});
-  }));
+  range(1, 9).run(FilterEvenEmit{.out = evens});
   assert((evens == std::vector{2, 4, 6, 8}));
   std::cout << "7. filter (even):";
   for (int v : evens)
     std::cout << " " << v;
   std::cout << "\n";
 
-  // 8. Absorb Emit<int> mid-chain from range_logged; Log still propagates.
-  //    handle<Emit<int>>(range_logged(...), ...) → Log::Fx<void>
+  // 8. Absorb Emit<int> mid-chain from range_logged via .bind(); Log still propagates.
+  //    range_logged(2,5) : Row<Emit<int>,Log>::Fx<void>
+  //    .bind(CollectEmit) : BoundFx — remaining: Log
+  //    .run(CountLog)     : Log handled
   std::vector<int> mid;
   int mid_logs = 0;
-  handle<Emit<int>>(range_logged(2, 5),
-                    handler<Emit<int>>([&](Emit<int> e, auto r) {
-                      mid.push_back(e.value);
-                      r({});
-                    }))
-      .run(handler<Log>([&](Log, auto r) {
-        ++mid_logs;
-        r({});
-      }));
+  range_logged(2, 5)
+      .bind(CollectEmit<int>{.out = mid})
+      .run(CountLog{.count = mid_logs});
   assert((mid == std::vector{2, 3, 4}));
   assert(mid_logs == 2);
   std::cout << "8. mid-chain absorb: " << mid.size() << " values collected, "
