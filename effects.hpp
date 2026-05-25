@@ -240,6 +240,13 @@ concept TypedHandler =
 
 namespace detail {
 
+// Heap-allocated only on the abort path (handler returns non-void).
+// Keeps owner identity + typed payload completely off the common-case frame.
+struct AbortContext {
+  void *owner = nullptr; // &HandlerNode or composite group_id
+  AnyVal value;          // typed result returned by the aborting handler
+};
+
 // Non-templated base for the abort slot in every promise.
 // Stored by pointer in PerformAwaitable so ScopedHandler::dispatch can
 // signal abort without knowing T or Es.
@@ -250,8 +257,11 @@ struct PromiseAbortBase {
   // Compile-time index of the performing effect in declared_effects — set
   // by await_suspend so run_push() base can use O(1) table lookup.
   uint8_t effect_index = 0;
-  void *abort_owner = nullptr; // address of the handler that aborted
-  detail::AnyVal abort_value;  // typed abort value, set by aborting handler
+  // Previously abort_owner (8B) + abort_value (AnyVal=48B) = 56B lived here
+  // on every frame.  Now a single pointer: null on the common resuming path;
+  // heap-allocated once the first time a handler returns non-void.  Saves
+  // 48 bytes from every coroutine frame.
+  AbortContext *abort_ctx = nullptr;
 
   // Moved here from PromiseBase so that resume can reach them
   // through the non-templated abort_base_ pointer on PerformAwaitable.
@@ -263,6 +273,9 @@ struct PromiseAbortBase {
   // Points to the std::optional<T> result member inside the typed promise.
   // Set by get_return_object().  Null for Fx<void> computations.
   void *result_ptr = nullptr;
+
+  // Free any outstanding AbortContext (handles exception-path leaks).
+  ~PromiseAbortBase() { delete abort_ctx; }
 };
 
 struct HandlerNode {
@@ -753,9 +766,11 @@ struct ScopedHandler {
           hh.handle(pa->effect_, Token{pa});
         } else {
           auto val = hh.handle(pa->effect_, Token{pa});
+          if (!pa->abort_base_->abort_ctx)
+            pa->abort_base_->abort_ctx = new detail::AbortContext();
+          pa->abort_base_->abort_ctx->owner = n->handler_obj;
+          pa->abort_base_->abort_ctx->value.emplace(std::move(val));
           pa->abort_base_->aborted = true;
-          pa->abort_base_->abort_owner = n->handler_obj;
-          pa->abort_base_->abort_value.emplace(std::move(val));
         }
       } else if constexpr (detail::HasReturnClause<std::remove_cvref_t<H>,
                                                    ResultT>) {
@@ -777,9 +792,11 @@ struct ScopedHandler {
                                Token{pa, &detail::apply_on_return<Hb, ResultT>,
                                      static_cast<void *>(&hh),
                                      &detail::extract_result_impl<RawT>, n});
+          if (!pa->abort_base_->abort_ctx)
+            pa->abort_base_->abort_ctx = new detail::AbortContext();
+          pa->abort_base_->abort_ctx->owner = n->handler_obj;
+          pa->abort_base_->abort_ctx->value.emplace(std::move(val));
           pa->abort_base_->aborted = true;
-          pa->abort_base_->abort_owner = n->handler_obj;
-          pa->abort_base_->abort_value.emplace(std::move(val));
         }
       } else {
         // Plain Cont<E, ResultT> — no Koka transform.
@@ -790,9 +807,11 @@ struct ScopedHandler {
         } else {
           // Handler returned non-void: abort path. Must NOT call r().
           auto val = hh.handle(pa->effect_, Token{pa});
+          if (!pa->abort_base_->abort_ctx)
+            pa->abort_base_->abort_ctx = new detail::AbortContext();
+          pa->abort_base_->abort_ctx->owner = n->handler_obj; // &node or group_id
+          pa->abort_base_->abort_ctx->value.emplace(std::move(val));
           pa->abort_base_->aborted = true;
-          pa->abort_base_->abort_owner = n->handler_obj; // = &node or group_id
-          pa->abort_base_->abort_value.emplace(std::move(val));
         }
       }
     };
@@ -932,35 +951,40 @@ private:
     // Did THIS handler abort? Compare against the node's own address (unique
     // even when the handler object is an empty type and aliases another's
     // addr).
-    if (ab && ab->aborted &&
-        ab->abort_owner == static_cast<void *>(&guard.node)) {
+    if (ab && ab->aborted && ab->abort_ctx &&
+        ab->abort_ctx->owner == static_cast<void *>(&guard.node)) {
       ab->aborted = false;
+      auto *ctx = std::exchange(ab->abort_ctx, nullptr);
       if constexpr (detail::HasReturnClause<Hb, InnerR>) {
         // Koka path: dispatch passed Cont<E, OutT> so handle returned OutT = R.
-        // abort_value already holds R; extract directly.
-        return std::optional<R>{ab->abort_value.template take<R>()};
+        auto result = ctx->value.template take<R>();
+        delete ctx;
+        return std::optional<R>{std::move(result)};
       } else if constexpr (detail::HasDrivingOperatorFor<Hb, InnerR>) {
         // Non-void handle without Koka on_return(InnerR):
-        // abort_value holds DrivingR; optionally chain on_return(DrivingR).
+        // abort_ctx->value holds DrivingR; optionally chain on_return.
         using DrivingR = detail::driving_return_for_t<Hb, InnerR>;
-        auto raw = ab->abort_value.template take<DrivingR>();
+        auto raw = ctx->value.template take<DrivingR>();
+        delete ctx;
         if constexpr (detail::HasReturnClause<Hb, DrivingR>)
           return std::optional<R>{h.on_return(std::move(raw))};
         else
           return std::optional<R>{std::move(raw)};
       } else {
-        return std::optional<R>{ab->abort_value.template take<R>()};
+        auto result = ctx->value.template take<R>();
+        delete ctx;
+        return std::optional<R>{std::move(result)};
       }
     }
     if (!inner) {
       // Abort still in flight for an outer level.  Best-effort: apply this
-      // handler's on_return to the abort_value if its type matches InnerR,
+      // handler's on_return to the abort value if its type matches InnerR,
       // so that on_return fires even on the abort path.
       if constexpr (detail::HasReturnClause<Hb, InnerR>) {
-        if (ab && ab->aborted) {
-          if (ab->abort_value.template has_type<InnerR>()) {
-            auto v = ab->abort_value.template take<InnerR>();
-            ab->abort_value.emplace(h.on_return(std::move(v)));
+        if (ab && ab->aborted && ab->abort_ctx) {
+          if (ab->abort_ctx->value.template has_type<InnerR>()) {
+            auto v = ab->abort_ctx->value.template take<InnerR>();
+            ab->abort_ctx->value.emplace(h.on_return(std::move(v)));
           }
         }
       }
@@ -989,9 +1013,12 @@ private:
     auto inner =
         run_push_composite(h, group_id, typename Hb::effect_types{}, rest...);
     auto *ab = get_abort_base();
-    if (ab && ab->aborted && ab->abort_owner == group_id) {
+    if (ab && ab->aborted && ab->abort_ctx && ab->abort_ctx->owner == group_id) {
       ab->aborted = false;
-      return std::optional<R>{ab->abort_value.template take<R>()};
+      auto *ctx = std::exchange(ab->abort_ctx, nullptr);
+      auto result = ctx->value.template take<R>();
+      delete ctx;
+      return std::optional<R>{std::move(result)};
     }
     if (!inner)
       return std::nullopt;
@@ -1333,7 +1360,11 @@ public:
 
   // Public so ScopedHandler::dispatch and any static-dispatch helper
   // can access them without friendship boilerplate.
-  E effect_;
+  // [[no_unique_address]]: for empty effect structs whose result_type has
+  // ≥ 8-byte alignment (e.g. result_type = std::string or int64_t), the
+  // compiler can overlap effect_ with result_, saving up to 8 bytes on
+  // the coroutine frame.
+  [[no_unique_address]] E effect_;
   typename E::result_type result_{};
   std::coroutine_handle<> caller_{};
   detail::PromiseAbortBase *abort_base_ = nullptr; // set in await_suspend
