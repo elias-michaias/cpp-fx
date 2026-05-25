@@ -116,42 +116,38 @@ static auto ask_then_multi_log(int n) -> Row<Ask, Log>::Fx<int> {
 // ---- Handlers ---------------------------------------------------------------
 
 // Handles Fail by resuming with 0; on_return converts int → string.
-struct IntToStr : Fail::Handler<IntToStr> {
+struct IntToStr : Fail::Handler {
   void handle(Fail, auto r) { r(0); }
   auto on_return(auto v) -> std::string { return std::to_string(v); }
 };
-VALIDATE_HANDLER(IntToStr);
 
 // Dual-mode: abort (→ nullopt) on Fail; on_return wraps success int →
 // optional<int>.
-struct FailToOpt : Fail::Handler<FailToOpt> {
+struct FailToOpt : Fail::Handler {
   auto handle(Fail, auto) -> std::optional<int> { return std::nullopt; }
   auto on_return(auto v) -> std::optional<int> { return v; }
 };
-VALIDATE_HANDLER(FailToOpt);
 
 // Abort on Fail with reason; on_return wraps success → expected<int, string>.
-struct FailToExp : Fail::Handler<FailToExp> {
+struct FailToExp : Fail::Handler {
   auto handle(Fail f, auto) -> std::expected<int, std::string> {
     return std::unexpected(f.reason);
   }
   auto on_return(int v) -> std::expected<int, std::string> { return v; }
 };
-VALIDATE_HANDLER(FailToExp);
 
 // User-defined wrapper; both abort and success path return Tagged.
 struct Tagged {
   int value;
   bool ok;
 };
-struct FailToTagged : Fail::Handler<FailToTagged> {
+struct FailToTagged : Fail::Handler {
   auto handle(Fail, auto) -> Tagged { return {-1, false}; }
   auto on_return(int v) -> Tagged { return {v, true}; }
 };
-VALIDATE_HANDLER(FailToTagged);
 
 // Counts Log messages; on_return wraps any T → pair<T, log_count>.
-template <typename T> struct LogCount : Log::Handler<LogCount<T>> {
+template <typename T> struct LogCount : Log::Handler {
   int count = 0;
   void handle(Log, auto r) {
     ++count;
@@ -161,17 +157,16 @@ template <typename T> struct LogCount : Log::Handler<LogCount<T>> {
 };
 
 // Counts Log messages but has no on_return — purely side-effectful.
-struct LogSilent : Log::Handler<LogSilent> {
+struct LogSilent : Log::Handler {
   int count = 0;
   void handle(Log, auto r) {
     ++count;
     r({});
   }
 };
-VALIDATE_HANDLER(LogSilent);
 
 // Handles Ask with a fixed reply; wraps T → optional<T> on return.
-template <typename T> struct AskOpt : Ask::Handler<AskOpt<T>> {
+template <typename T> struct AskOpt : Ask::Handler {
   std::string reply;
   void handle(Ask, auto r) { r(reply); }
   auto on_return(T v) -> std::optional<T> { return std::move(v); }
@@ -179,7 +174,7 @@ template <typename T> struct AskOpt : Ask::Handler<AskOpt<T>> {
 
 // Handles Ask by always aborting; on_return wraps T → optional<T> (never
 // called).
-template <typename T> struct AskAbort : Ask::Handler<AskAbort<T>> {
+template <typename T> struct AskAbort : Ask::Handler {
   auto handle(Ask, auto) -> std::optional<T> { return std::nullopt; }
   auto on_return(T v) -> std::optional<T> { return std::move(v); }
 };
@@ -187,7 +182,7 @@ template <typename T> struct AskAbort : Ask::Handler<AskAbort<T>> {
 // Composite handler: handles both Ask and Log, wraps int → tuple<int, string,
 // int>.
 using AskLog = Row<Ask, Log>;
-struct ScriptedAskLog : AskLog::Handler<ScriptedAskLog> {
+struct ScriptedAskLog : AskLog::Handler {
   std::string name;
   std::vector<std::string> logs;
   void handle(Ask, auto r) { r(name); }
@@ -199,29 +194,25 @@ struct ScriptedAskLog : AskLog::Handler<ScriptedAskLog> {
     return {v, name, static_cast<int>(logs.size())};
   }
 };
-VALIDATE_HANDLER(ScriptedAskLog);
 
 // Reference-counting Log handler for inline test assertions.
-struct CountLog : Log::Handler<CountLog> {
+struct CountLog : Log::Handler {
   int &count;
   void handle(Log, auto r) { ++count; r({}); }
 };
-VALIDATE_HANDLER(CountLog);
 
 // Reference-recording Log handler (captures log messages by ref).
-struct RecordLog : Log::Handler<RecordLog> {
+struct RecordLog : Log::Handler {
   std::vector<std::string> &msgs;
   void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
 };
-VALIDATE_HANDLER(RecordLog);
 
 // Reference-counting Ask handler with a fixed reply.
-struct CountAsk : Ask::Handler<CountAsk> {
+struct CountAsk : Ask::Handler {
   int &count;
   std::string reply;
   void handle(Ask, auto r) { ++count; r(reply); }
 };
-VALIDATE_HANDLER(CountAsk);
 
 // ---- Tests ------------------------------------------------------------------
 
@@ -382,7 +373,7 @@ static auto prompt_length() -> Ask::Fx<int> {
   co_return static_cast<int>(answer.size());
 }
 
-struct AnnotatedAsk : Ask::Handler<AnnotatedAsk> {
+struct AnnotatedAsk : Ask::Handler {
   // T is deduced as `int` here (the computation returns int).
   // The handler never mentions int — it works for any non-void T.
   template <typename T> auto handle(Ask e, Cont<Ask, T> k) -> std::string {
@@ -390,7 +381,6 @@ struct AnnotatedAsk : Ask::Handler<AnnotatedAsk> {
     return "Q=[" + e.prompt + "] A_len=" + std::to_string(len);
   }
 };
-VALIDATE_HANDLER(AnnotatedAsk);
 
 static void test_capture_effect_then_on_return() {
   auto result = prompt_length().run(AnnotatedAsk{});
@@ -402,41 +392,37 @@ static void test_capture_effect_then_on_return() {
 
 // Cont passthrough spy: drives k with a given answer, returns T unchanged.
 // T is deduced — works for any computation return type.
-struct SpyAsk : Ask::Handler<SpyAsk> {
+struct SpyAsk : Ask::Handler {
   std::string answer;
   template <typename T> T handle(Ask, Cont<Ask, T> k) {
     return k.resume(answer); // drive to completion, T→T
   }
 };
-VALIDATE_HANDLER(SpyAsk);
 
 // Resume-only log capture: records messages but has no on_return.
-struct CaptureLog : Log::Handler<CaptureLog> {
+struct CaptureLog : Log::Handler {
   std::vector<std::string> messages;
   void handle(Log e, auto r) {
     messages.push_back(e.message);
     r({});
   }
 };
-VALIDATE_HANDLER(CaptureLog);
 
 // Resume-only Fail recovery: resumes with a fixed fallback; no on_return.
-struct RecoverFail : Fail::Handler<RecoverFail> {
+struct RecoverFail : Fail::Handler {
   int fallback;
   void handle(Fail, auto r) { r(fallback); }
 };
-VALIDATE_HANDLER(RecoverFail);
 
 // Cont Ask handler: drives computation and annotates the result as a string.
 // T→string type transform.
-struct AnnotateCont : Ask::Handler<AnnotateCont> {
+struct AnnotateCont : Ask::Handler {
   std::string given;
   template <typename T> std::string handle(Ask e, Cont<Ask, T> k) {
     T v = k.resume(given);
     return "[" + e.prompt + "→" + given + "]=" + std::to_string(v);
   }
 };
-VALIDATE_HANDLER(AnnotateCont);
 
 // ---- Tests 12-17 ------------------------------------------------------------
 
@@ -531,7 +517,7 @@ static void test_three_level_cont_pipeline() {
        "on_return (int→pair): int→int→pair<int,int>");
 }
 
-struct HandleLog : Log::Handler<HandleLog> {
+struct HandleLog : Log::Handler {
   std::vector<std::string> captured;
 
   void handle(Log e, auto r) {
@@ -599,7 +585,7 @@ static void test_sequential_cont_pipeline() {
 // Accumulates log messages during execution (handle fires N times), then
 // packages them all with the final result (on_return fires once at the end).
 // Template on_return so it wraps ANY inner type T.
-struct LogAccumulate : Log::Handler<LogAccumulate> {
+struct LogAccumulate : Log::Handler {
   std::vector<std::string> msgs;
   void handle(Log e, auto r) {
     msgs.push_back(e.message);
@@ -613,7 +599,7 @@ struct LogAccumulate : Log::Handler<LogAccumulate> {
 
 // Counts Ask invocations during execution; appends count to result on_return.
 // Template on_return so it composes with any inner result type T.
-struct AskCount : Ask::Handler<AskCount> {
+struct AskCount : Ask::Handler {
   int n = 0;
   void handle(Ask, auto r) {
     ++n;
@@ -623,10 +609,9 @@ struct AskCount : Ask::Handler<AskCount> {
     return {std::move(v), n};
   }
 };
-VALIDATE_HANDLER(AskCount);
 
 // Counts Fail invocations during execution; appends count to result on_return.
-struct FailCount : Fail::Handler<FailCount> {
+struct FailCount : Fail::Handler {
   int n = 0;
   void handle(Fail, auto r) {
     ++n;
@@ -636,26 +621,24 @@ struct FailCount : Fail::Handler<FailCount> {
     return {std::move(v), n};
   }
 };
-VALIDATE_HANDLER(FailCount);
 
 // ---- Handlers for tests 22-24 -----------------------------------------------
 
 // Koka-style driving handler: on_return fires INSIDE k.resume() so the handle
 // function sees OutT = pair<int,string> rather than raw int.
 // Handle simply passes the already-wrapped value through.
-struct KokaWrap : Ask::Handler<KokaWrap> {
+struct KokaWrap : Ask::Handler {
   auto handle(Ask, auto k) { return k.resume("hello"); }
   auto on_return(int v) -> std::pair<int, std::string> {
     return {v, "len=" + std::to_string(v)};
   }
 };
-VALIDATE_HANDLER(KokaWrap);
 
 // Non-void handle where DrivingR ≠ InnerR (old DrivingR path, no Koka).
 // Has on_return(string), NOT on_return(int), so HasReturnClause<H,int>=false.
 // Drive path: handle drives k.resume("Q") → raw int → converts to string.
 // on_return wraps DrivingR=string → pair<string,int>.
-struct DriveAndStringify : Ask::Handler<DriveAndStringify> {
+struct DriveAndStringify : Ask::Handler {
   template <typename T> std::string handle(Ask, Cont<Ask, T> k) {
     T raw = k.resume("Q");
     return "result:" +
@@ -665,12 +648,11 @@ struct DriveAndStringify : Ask::Handler<DriveAndStringify> {
     return {s, static_cast<int>(s.size())};
   }
 };
-VALIDATE_HANDLER(DriveAndStringify);
 
 // Koka handler that ALSO uses the OutT value from k.resume() in handle,
 // performing a further transformation of its own before returning.
 // on_return(int → pair<int,string>); handle unpacks pair and re-annotates.
-struct KokaAnnotate : Ask::Handler<KokaAnnotate> {
+struct KokaAnnotate : Ask::Handler {
   auto handle(Ask e, auto k) -> std::pair<int, std::string> {
     auto [n, tag] = k.resume(e.prompt); // OutT = pair<int,string>
     return {n, e.prompt + ":" + tag};   // re-annotate with prompt
@@ -679,16 +661,14 @@ struct KokaAnnotate : Ask::Handler<KokaAnnotate> {
     return {v, "len=" + std::to_string(v)};
   }
 };
-VALIDATE_HANDLER(KokaAnnotate);
 
 // Void handle + on_return: handles Log normally, then adds 1000 to the result
 // via on_return.  Used in test 24 to show this on_return is bypassed when an
 // outer Koka driving handler's abort propagates past this level.
-struct LogAddLarge : Log::Handler<LogAddLarge> {
+struct LogAddLarge : Log::Handler {
   void handle(Log, auto r) { r({}); }
   auto on_return(int v) -> int { return v + 1000; }
 };
-VALIDATE_HANDLER(LogAddLarge);
 
 // ---- Tests 18-21 ------------------------------------------------------------
 
@@ -934,11 +914,10 @@ static void test_fifo_on_return_inside_resume() {
 //       LogAddLarge.on_return(505) = 1505
 //       KokaWrap.on_return(1505) = {1505,"len=1505"}
 
-struct FailAddOffset : Fail::Handler<FailAddOffset> {
+struct FailAddOffset : Fail::Handler {
   void handle(Fail, auto r) { r(0); } // resume with 0 on error
   auto on_return(int v) -> int { return v + 500; }
 };
-VALIDATE_HANDLER(FailAddOffset);
 
 static auto ask_log_fail_comp(bool fail) -> Row<Ask, Log, Fail>::Fx<int> {
   auto name = perform(Ask{.prompt = "?"});
@@ -992,11 +971,10 @@ static void test_fifo_three_handlers_fail_resumption() {
 //
 //     LogMul2: void handle Log, on_return(int v) → int { return v * 2; }
 
-struct LogMul2 : Log::Handler<LogMul2> {
+struct LogMul2 : Log::Handler {
   void handle(Log, auto r) { r({}); }
   auto on_return(int v) -> int { return v * 2; }
 };
-VALIDATE_HANDLER(LogMul2);
 
 // run(KokaWrap, LogAddLarge, LogMul2) — two handlers for Log… wait, can't
 // have two handlers for the same effect.  Use a computation with Log and Fail:
@@ -1028,11 +1006,10 @@ VALIDATE_HANDLER(LogMul2);
 // For 5: (+500 then *2) = 1010; (*2 then +500) = 510.
 // We need a MulHandler on Fail and AddHandler on Log, or vice versa.
 
-struct FailMul2 : Fail::Handler<FailMul2> {
+struct FailMul2 : Fail::Handler {
   void handle(Fail, auto r) { r(0); }
   auto on_return(int v) -> int { return v * 2; }
 };
-VALIDATE_HANDLER(FailMul2);
 
 // run(KokaWrap, LogAddLarge, FailMul2) on ask_log_fail_comp(false)=5:
 //   FIFO walk (innermost first):

@@ -40,37 +40,32 @@ using All = Row<IO, Fail>;
 
 // ---- Common handler structs ------------------------------------------------
 
-struct StdoutLog : Log::Handler<StdoutLog> {
+struct StdoutLog : Log::Handler {
   void handle(Log e, auto r) {
     std::cout << "[log] " << e.message << "\n";
     r({});
   }
 };
-VALIDATE_HANDLER(StdoutLog);
 
-struct SilentLog : Log::Handler<SilentLog> {
+struct SilentLog : Log::Handler {
   void handle(Log, auto r) { r({}); }
 };
-VALIDATE_HANDLER(SilentLog);
 
-struct WarnFail : Fail::Handler<WarnFail> {
+struct WarnFail : Fail::Handler {
   void handle(Fail e, auto r) {
     std::cout << "[fail] " << e.reason << " -> -1\n";
     r(-1);
   }
 };
-VALIDATE_HANDLER(WarnFail);
 
-struct FallbackFail : Fail::Handler<FallbackFail> {
+struct FallbackFail : Fail::Handler {
   int fallback;
   void handle(Fail, auto r) { r(fallback); }
 };
-VALIDATE_HANDLER(FallbackFail);
 
 // Cycles through a scripted list of answers, repeating from the start.
-struct ScriptedAskCycling : Ask::Handler<ScriptedAskCycling> {
+struct ScriptedAskCycling : Ask::Handler {
   std::vector<std::string> answers;
   int idx = 0;
   void handle(Ask, auto r) { r(answers[idx++ % (int)answers.size()]); }
 };
-VALIDATE_HANDLER(ScriptedAskCycling);

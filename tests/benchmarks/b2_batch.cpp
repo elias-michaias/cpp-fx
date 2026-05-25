@@ -35,11 +35,10 @@ static auto sum_ticks(int n) -> Tick::Fx<long long> {
   co_return total;
 }
 
-struct TickCounter : Tick::Handler<TickCounter> {
+struct TickCounter : Tick::Handler {
   int &counter;
   void handle(Tick, auto r) { r(++counter); }
 };
-VALIDATE_HANDLER(TickCounter);
 
 // ---- main ------------------------------------------------------------------
 

@@ -92,27 +92,24 @@ auto prompted_div() -> IO::Fx<int> {
 
 // ---- Tests -----------------------------------------------------------------
 
-struct ScriptedAskFixed : Ask::Handler<ScriptedAskFixed> {
+struct ScriptedAskFixed : Ask::Handler {
   std::string answer;
   void handle(Ask, auto r) { r(answer); }
 };
-VALIDATE_HANDLER(ScriptedAskFixed);
 
-struct RecordLog : Log::Handler<RecordLog> {
+struct RecordLog : Log::Handler {
   std::vector<std::string> &msgs;
   void handle(Log e, auto r) {
     msgs.push_back(e.message);
     r({});
   }
 };
-VALIDATE_HANDLER(RecordLog);
 
-struct IndexedAsk : Ask::Handler<IndexedAsk> {
+struct IndexedAsk : Ask::Handler {
   const char *const *inputs;
   int &idx;
   void handle(Ask, auto r) { r(std::string{inputs[idx++]}); }
 };
-VALIDATE_HANDLER(IndexedAsk);
 
 int main() {
   // 1a. ask_silently: Log absorbed, caller only provides Ask.

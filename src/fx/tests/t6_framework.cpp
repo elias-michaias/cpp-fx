@@ -269,7 +269,7 @@ auto safe_div(int a, int b) -> Fail::Fx<int> {
     co_return a / b;
 }
 
-struct FailToOpt : Fail::Handler<FailToOpt> {
+struct FailToOpt : Fail::Handler {
     // Normal path: wrap the computation result in optional.
     auto on_return(int val) -> std::optional<int> { return val; }
     // Abort path: return nullopt without calling r().

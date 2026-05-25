@@ -64,7 +64,7 @@ static auto fx_range(int n) -> Emit<int>::Fx<void> {
 
 // ---- named handler: collects emitted ints into an output vector ------------
 
-struct CollectInts : Emit<int>::Handler<CollectInts> {
+struct CollectInts : Emit<int>::Handler {
   std::vector<int> &out;
   void handle(Emit<int> e, auto r) { out.push_back(e.value); r({}); }
 };

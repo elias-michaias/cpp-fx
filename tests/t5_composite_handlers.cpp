@@ -2,7 +2,7 @@
 //
 // A Row<E1, E2, ...> names a set of effects and unlocks:
 //   • Row::Fx<T>          — return type declaring all effects in the row
-//   • Row::Handler<D>     — CRTP base; D must provide handle() for every E
+//   • Row::Handler     — CRTP base; D must provide handle() for every E
 //   • Combine<R1, R2>     — merge two rows
 //   • VALIDATE_HANDLER(H) — static_assert that H is complete (fires at
 //                            definition time, before H is ever instantiated)
@@ -48,9 +48,9 @@ auto ratio() -> All::Fx<std::string> {
 
 // ---- Composite handler structs ---------------------------------------------
 
-// IO::Handler<Derived> gives `using effect_types = type_list<Ask, Log>`.
+// IO::Handler gives `using effect_types = type_list<Ask, Log>`.
 // D must provide  handle(Ask, ...) and  handle(Log, ...).
-struct ScriptedIO : IO::Handler<ScriptedIO> {
+struct ScriptedIO : IO::Handler {
   std::vector<std::string> answers;
   int idx = 0;
   void handle(Ask e, auto r) {
@@ -62,10 +62,9 @@ struct ScriptedIO : IO::Handler<ScriptedIO> {
     r({});
   }
 };
-VALIDATE_HANDLER(ScriptedIO);
 
-// All::Handler<Derived> covers Ask + Log + Fail in a single struct.
-struct ScriptedAll : All::Handler<ScriptedAll> {
+// All::Handler covers Ask + Log + Fail in a single struct.
+struct ScriptedAll : All::Handler {
   std::vector<std::string> answers;
   int idx = 0;
   void handle(Ask e, auto r) {
@@ -81,26 +80,23 @@ struct ScriptedAll : All::Handler<ScriptedAll> {
     r(-1);
   }
 };
-VALIDATE_HANDLER(ScriptedAll);
 
 // ---- Tests -----------------------------------------------------------------
 
 // Inline composite for tests 6-7: handles IO (Ask+Log) with reference state.
-struct CountingIO : IO::Handler<CountingIO> {
+struct CountingIO : IO::Handler {
   std::string ask_reply;
   int &log_count;
   void handle(Ask, auto r) { r(ask_reply); }
   void handle(Log, auto r) { ++log_count; r({}); }
 };
-VALIDATE_HANDLER(CountingIO);
 
-struct IndexedIO : IO::Handler<IndexedIO> {
+struct IndexedIO : IO::Handler {
   const char *const *inputs;
   int &idx;
   void handle(Ask, auto r) { r(std::string{inputs[idx++]}); }
   void handle(Log, auto r) { r({}); }
 };
-VALIDATE_HANDLER(IndexedIO);
 
 int main() {
   // 1. Single composite struct covers Ask + Log — one argument to .run().

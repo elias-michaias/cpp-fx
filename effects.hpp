@@ -3,7 +3,7 @@
 //
 // --- API -------------------------------------------------------------------
 //
-//  Effect<Self>     -- CRTP base; gives Self::Fx<R> and Self::Handler<Derived>
+//  Effect<Self>     -- CRTP base; gives Self::Fx<R> and Self::Handler
 //                      Use: struct MyEff : Effect<MyEff> { using result_type =
 //                      T; };
 //  Handler H        -- struct with handle(E, fx::Resume<E>) -> void
@@ -24,7 +24,6 @@
 //                              BoundFx::run(remaining...) fills the rest
 //                              BoundFx::bind(more...) adds further handlers
 
-//  VALIDATE_HANDLER(H)      -- static_assert at definition site that H is
 #include <any>
 #include <coroutine>
 #include <exception>
@@ -174,7 +173,7 @@ template <Effectful E> struct Resume {
 ///
 /// For polymorphism over T, write a template operator():
 ///
-///   struct CacheHit : Ask::Handler<CacheHit> {
+///   struct CacheHit : Ask::Handler {
 ///     std::map<std::string, std::any> cache;
 ///     template <typename T>
 ///     auto operator()(Ask e, Cont<Ask, T> k) -> T {
@@ -227,7 +226,7 @@ concept HandlerFor =
     };
 
 /// Satisfied by handler objects that advertise their target effect via
-/// an `effect_type` alias (produced by `Effect::Handler<Derived>` or
+/// an `effect_type` alias (produced by `Effect::Handler` or
 /// satisfies `TypedHandler`.  Used by `run_impl` to dispatch single-effect
 /// handlers without ambiguity with composite handlers.
 template <typename H>
@@ -663,7 +662,7 @@ using composed_return_t = typename composed_return<T, Hs...>::type;
 /// Requires an `effect_types` alias (a `detail::type_list<Es...>`) and an
 /// `handle(Ei, auto resume)` overload for every `Ei` in that list.
 ///
-/// Produced by `Row<Es...>::Handler<Derived>` or `handler<Row>(lambdas...)`.
+/// Produced by `Row<Es...>::Handler` or `handler<Row>(lambdas...)`.
 /// Composite handlers are accepted by `.run()` just like single-effect ones.
 template <typename H>
 concept CompositeHandler =
@@ -1566,7 +1565,7 @@ void Resume<E>::operator()(typename E::result_type v) const {
 /// Use this inside a handler's `operator()` instead of calling `k(v)` when
 /// you want to observe the computation's result inline — Koka-style:
 ///
-///   struct Intercept : Ask::Handler<Intercept> {
+///   struct Intercept : Ask::Handler {
 ///     auto operator()(Ask e, auto k) -> std::string {
 ///       int len = fx::resume<int>(k, "hello");
 ///       return "prompt=[" + e.prompt + "] len=" + std::to_string(len);
@@ -1656,18 +1655,16 @@ template <Effectful E> auto perform_impl(E e) {
 ///
 /// Provides:
 ///   `IO::Fx<T>`            — coroutine return type for all row effects
-///   `IO::Handler<Derived>` — CRTP base for composite handler structs
+///   `IO::Handler` — base for composite handler structs
 template <Effectful... Es> struct BasicRow {
   template <typename T> using Fx = ::fx::Fx<T, Es...>;
 
   using effects = detail::type_list<Es...>;
 
-  /// CRTP base for composite handler structs.
-  /// Inherit as: `struct MyHandler : IO::Handler<MyHandler> { ... }`
-  /// then provide `operator()(Ei, auto resume)` for every `Ei` in the row.
-  /// Use `VALIDATE_HANDLER(MyHandler)` to get a definition-time error if
-  /// any overload is missing.
-  template <typename Derived> struct Handler {
+  /// Base for composite handler structs.
+  /// Inherit as: `struct MyHandler : IO::Handler { ... }`
+  /// then provide `handle(Ei, auto resume)` for every `Ei` in the row.
+  struct Handler {
     using effect_types = detail::type_list<Es...>;
   };
 };
@@ -1689,6 +1686,15 @@ using row_from_list_t = typename row_from_list<List>::type;
 template <typename... Ts>
 using Row = detail::row_from_list_t<detail::flatten_effects_t<Ts...>>;
 
+template <typename H, typename E>
+concept Handles = requires(H h, E e) {
+  { h.handle(e, std::any{}) };
+};
+
+template <typename H, typename E>
+requires Handles<H, E>
+struct ValidateHandler {};
+
 /// CRTP base for a single-effect type.
 ///
 /// Inherit to define an effect:
@@ -1700,17 +1706,17 @@ using Row = detail::row_from_list_t<detail::flatten_effects_t<Ts...>>;
 ///
 /// Provides:
 ///   `Ask::Fx<T>`            — coroutine return type
-///   `Ask::Handler<Derived>` — CRTP base for handler structs
+///   `Ask::Handler`           — base for handler structs
+
 template <typename Self> struct Effect {
   template <typename T> using Fx = ::fx::Fx<T, Self>;
 
-  /// CRTP base for single-effect handler structs.
+  /// Base for single-effect handler structs.
   ///
-  ///   struct StdinAsk : Ask::Handler<StdinAsk> {
-  ///     void operator()(Ask e, auto r) { ... }
+  ///   struct StdinAsk : Ask::Handler {
+  ///     void handle(Ask e, auto r) { ... }
   ///   };
-  ///   VALIDATE_HANDLER(StdinAsk);
-  template <typename Derived> struct Handler {
+  struct Handler {
     using effect_type = Self;
   };
 };
@@ -1726,23 +1732,3 @@ template <typename Self> struct Effect {
 /// return type.  Fix: add `E` to the effect list: `E::Fx<T>` or
 /// `Row<..., E>::Fx<T>`.
 #define perform(e) co_await ::fx::detail::perform_impl(e)
-
-/// Asserts at definition time that handler struct `H` provides an
-/// `operator()` overload for every effect it declares.
-///
-/// Place this immediately after the struct definition:
-///
-///   struct WarnFail : Fail::Handler<WarnFail> {
-///     void operator()(Fail e, auto r) { std::cerr << e.reason; r(-1); }
-///   };
-///   VALIDATE_HANDLER(WarnFail);
-///
-/// Works for both single-effect (`Effect::Handler`) and row
-/// (`Row::Handler`) bases.  Produces an IDE squiggle on this line (not
-/// at the usage site) when an overload is missing.
-#define VALIDATE_HANDLER(H)                                                    \
-  static_assert(                                                               \
-      ::fx::TypedHandler<H> || ::fx::CompositeHandler<H>,                      \
-      "'" #H "' is missing handle() for one or more of its declared "          \
-      "effects. Each effect E requires: void handle(E, auto resume) "          \
-      "{ ... }")

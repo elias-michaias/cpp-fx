@@ -33,7 +33,7 @@ struct Raise : fx::Effect<Raise<E>> {
 namespace detail {
 
 template <typename E, typename InnerR>
-struct RaiseHandler : Raise<E>::Handler<RaiseHandler<E, InnerR>> {
+struct RaiseHandler : Raise<E>::Handler {
     auto on_return(InnerR val) -> std::expected<InnerR, E> {
         return std::expected<InnerR, E>{std::move(val)};
     }

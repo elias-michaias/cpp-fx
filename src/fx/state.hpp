@@ -47,7 +47,7 @@ namespace detail {
 // Stores a raw pointer to the live state so copies of the handler
 // (made by run()) all see the same variable.
 template <typename S>
-struct StateHandler : State<S>::Handler<StateHandler<S>> {
+struct StateHandler : State<S>::Handler {
     S *ptr;
     void  handle(Get<S>,    auto r) const { r(*ptr); }
     void  handle(Put<S> p,  auto r)       { *ptr = std::move(p.value); r({}); }

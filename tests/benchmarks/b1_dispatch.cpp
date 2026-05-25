@@ -30,10 +30,9 @@ struct Increment : Effect<Increment> {
   int value;
 };
 
-struct IncrementHandler : Increment::Handler<IncrementHandler> {
+struct IncrementHandler : Increment::Handler {
   void handle(Increment e, auto r) { r(e.value + 1); }
 };
-VALIDATE_HANDLER(IncrementHandler);
 
 // ---- baselines -------------------------------------------------------------
 

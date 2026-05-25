@@ -6,7 +6,7 @@
 //   fx::run -- no handler for effect E (1st template arg).
 //
 // Cause: greet() declares IO::Fx<string> = Fx<string, Ask, Log>.
-// PartialIO is declared as IO::Handler<PartialIO> but only provides
+// PartialIO is declared as IO::Handler but only provides
 // handle(Ask, ...) — missing handle(Log, ...).
 //
 // VALIDATE_HANDLER(PartialIO) would catch this at definition time;
@@ -22,7 +22,7 @@ auto greet() -> IO::Fx<std::string> {
   co_return perform(Ask{.prompt = "Name: "});
 }
 
-struct PartialIO : IO::Handler<PartialIO> {
+struct PartialIO : IO::Handler {
   void handle(Ask, auto r) { r(std::string{"x"}); }
   // missing: void handle(Log, auto r) { r({}); }
 };

@@ -54,48 +54,42 @@ auto compute_ratio() -> All::Fx<std::string> {
 // ---- Local handler structs -------------------------------------------------
 
 // Records Ask prompts via reference; replies with a fixed value.
-struct RecordAsk : Ask::Handler<RecordAsk> {
+struct RecordAsk : Ask::Handler {
   std::vector<std::string> &prompts;
   std::string reply;
   void handle(Ask e, auto r) { prompts.push_back(e.prompt); r(reply); }
 };
-VALIDATE_HANDLER(RecordAsk);
 
 // Records log messages via reference.
-struct RecordLog : Log::Handler<RecordLog> {
+struct RecordLog : Log::Handler {
   std::vector<std::string> &msgs;
   void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
 };
-VALIDATE_HANDLER(RecordLog);
 
 // Records the Fail reason and resumes with fallback.
-struct RecordingFail : Fail::Handler<RecordingFail> {
+struct RecordingFail : Fail::Handler {
   std::string &reason;
   int fallback;
   void handle(Fail e, auto r) { reason = e.reason; r(fallback); }
 };
-VALIDATE_HANDLER(RecordingFail);
 
 // Counting handlers for effect-fire counting.
-struct CountAsk : Ask::Handler<CountAsk> {
+struct CountAsk : Ask::Handler {
   int &count;
   std::string reply;
   void handle(Ask, auto r) { ++count; r(reply); }
 };
-VALIDATE_HANDLER(CountAsk);
 
-struct CountLog : Log::Handler<CountLog> {
+struct CountLog : Log::Handler {
   int &count;
   void handle(Log, auto r) { ++count; r({}); }
 };
-VALIDATE_HANDLER(CountLog);
 
-struct CountFail : Fail::Handler<CountFail> {
+struct CountFail : Fail::Handler {
   int &count;
   int fallback;
   void handle(Fail, auto r) { ++count; r(fallback); }
 };
-VALIDATE_HANDLER(CountFail);
 
 // ---- Tests -----------------------------------------------------------------
 

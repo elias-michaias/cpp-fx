@@ -9,14 +9,14 @@
 // VALIDATE_HANDLER fires at definition time — before the type is ever used
 // in a .run() call.  The IDE squiggle appears on the macro line itself.
 //
-// Cause: IncompleteIO inherits IO::Handler<IncompleteIO>, which means it
+// Cause: IncompleteIO inherits IO::Handler, which means it
 // must provide operator() for both Ask and Log.  The Log overload is missing.
 //
 // Fix: add void operator()(Log e, auto r) { ... } to IncompleteIO.
 
 #include "../common.hpp"
 
-struct IncompleteIO : IO::Handler<IncompleteIO> {
+struct IncompleteIO : IO::Handler {
   void operator()(Ask, auto r) { r("x"); }
   // void operator()(Log, auto r) { r({}); }   <-- intentionally missing
 };

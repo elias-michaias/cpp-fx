@@ -3,7 +3,7 @@
 // Covers:
 //   • E::Fx<T> return type from the Effect<Self> CRTP base
 //   • perform(e) yields control to whatever handler is installed
-//   • E::Handler<Derived> CRTP for reusable named handler structs
+//   • E::Handler CRTP for reusable named handler structs
 //   • Fx<T> (pure, zero effects) — .run() needs no arguments
 //   • The same computation runs unchanged under different handlers
 
@@ -44,36 +44,32 @@ auto safe_div(int a, int b) -> Fail::Fx<int> {
 // ---- Named handler structs --------------------------------------------------
 
 // Always answers with the same scripted string.
-struct ScriptedAsk : Ask::Handler<ScriptedAsk> {
+struct ScriptedAsk : Ask::Handler {
   std::string answer;
   void handle(Ask, auto r) { r(answer); }
 };
-VALIDATE_HANDLER(ScriptedAsk);
 
 // Counts how many times Ask fires; side-channel via reference.
-struct CountingAsk : Ask::Handler<CountingAsk> {
+struct CountingAsk : Ask::Handler {
   int &count;
   std::string reply;
   void handle(Ask, auto r) { ++count; r(reply); }
 };
-VALIDATE_HANDLER(CountingAsk);
 
 // Records log messages via reference.
-struct RecordLog : Log::Handler<RecordLog> {
+struct RecordLog : Log::Handler {
   std::vector<std::string> &msgs;
   void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
 };
-VALIDATE_HANDLER(RecordLog);
 
 // Fail handler that prints a warning then resumes with a fallback.
-struct VerboseFail : Fail::Handler<VerboseFail> {
+struct VerboseFail : Fail::Handler {
   int fallback;
   void handle(Fail e, auto r) {
     std::cout << "   [warn] " << e.reason << "\n";
     r(fallback);
   }
 };
-VALIDATE_HANDLER(VerboseFail);
 
 // ---- Tests -----------------------------------------------------------------
 
