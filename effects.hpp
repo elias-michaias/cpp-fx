@@ -38,6 +38,20 @@
 #define FX_SMALL_ANY_SIZE 48
 #endif
 
+/// Define FX_NO_TLS before including effects.hpp to replace thread_local
+/// storage for the handler stack and allocator with plain globals.  Use this
+/// on single-threaded embedded targets where the OS provides no TLS support
+/// (and where emulated TLS would add a function call per stack access).
+// #define FX_NO_TLS
+
+/// Define FX_NO_EXCEPTIONS before including effects.hpp to strip
+/// std::exception_ptr from every coroutine frame and replace
+/// unhandled_exception() with std::terminate().  Use this on targets compiled
+/// with -fno-exceptions or where the 8-byte per-frame overhead is undesirable.
+/// Note: logical-error throws (unhandled effect, nested abort) remain — handle
+/// them by overriding dispatch_effect or catch at the outermost boundary.
+// #define FX_NO_EXCEPTIONS
+
 namespace fx {
 
 // --- Concepts ---------------------------------------------------------------
@@ -238,7 +252,9 @@ struct PromiseAbortBase {
   // through the non-templated abort_base_ pointer on PerformAwaitable.
   const void *effect_tag = nullptr;
   void *payload_ptr = nullptr;
+#ifndef FX_NO_EXCEPTIONS
   std::exception_ptr exception;
+#endif
   // Points to the std::optional<T> result member inside the typed promise.
   // Set by get_return_object().  Null for Fx<void> computations.
   void *result_ptr = nullptr;
@@ -259,11 +275,19 @@ struct HandlerNode {
   on_return_any_fn_t on_return_any_fn = nullptr;
 };
 
+#ifdef FX_NO_TLS
+inline HandlerNode *stack_top = nullptr;
+#else
 inline thread_local HandlerNode *stack_top = nullptr;
+#endif
 
 /// Active memory resource for this thread.  Null means use new/delete.
 /// Set via fx::ScopedAllocator — never write this directly.
+#ifdef FX_NO_TLS
+inline std::pmr::memory_resource *current_mr = nullptr;
+#else
 inline thread_local std::pmr::memory_resource *current_mr = nullptr;
+#endif
 
 template <Effectful E> inline constexpr char effect_tag_v = 0;
 
@@ -543,7 +567,11 @@ template <typename... Es> struct PromiseBase : PromiseAbortBase {
 
   std::suspend_always initial_suspend() noexcept { return {}; }
   std::suspend_always final_suspend() noexcept { return {}; }
+#ifdef FX_NO_EXCEPTIONS
+  void unhandled_exception() noexcept { std::terminate(); }
+#else
   void unhandled_exception() { exception = std::current_exception(); }
+#endif
   using declared_effects = type_list<Es...>;
 
   // Coroutine frame allocation — honours the active ScopedAllocator.
@@ -837,8 +865,10 @@ private:
         return std::nullopt;
     }
     auto &p = h.promise();
+#ifndef FX_NO_EXCEPTIONS
     if (p.exception)
       std::rethrow_exception(p.exception);
+#endif
     return std::move(*p.result);
   }
 
@@ -982,8 +1012,10 @@ public:
       detail::dispatch_effect(p.effect_tag, p.payload_ptr);
     }
     auto &p = h.promise();
+#ifndef FX_NO_EXCEPTIONS
     if (p.exception)
       std::rethrow_exception(p.exception);
+#endif
     return std::move(*p.result);
   }
 };
@@ -1073,8 +1105,10 @@ public:
       if (h.promise().aborted)
         return;
     }
+#ifndef FX_NO_EXCEPTIONS
     if (h.promise().exception)
       std::rethrow_exception(h.promise().exception);
+#endif
   }
 };
 
@@ -1264,8 +1298,10 @@ T resume(Resume<E> k, typename E::result_type v) {
       throw std::runtime_error(
           "fx::resume: computation aborted by a nested handler");
   }
+#ifndef FX_NO_EXCEPTIONS
   if (ab->exception)
     std::rethrow_exception(ab->exception);
+#endif
   return std::move(**static_cast<std::optional<T> *>(ab->result_ptr));
 }
 
@@ -1289,8 +1325,10 @@ T Cont<E, T>::resume(typename E::result_type v) const {
         throw std::runtime_error(
             "fx::resume: computation aborted by a nested handler");
     }
+#ifndef FX_NO_EXCEPTIONS
     if (ab->exception)
       std::rethrow_exception(ab->exception);
+#endif
     // Extract the raw result from the promise into an AnyVal (no heap alloc).
     auto current = extract_fn_(ab->result_ptr);
     // Walk inner handlers (from innermost toward own_node_, exclusive) and
