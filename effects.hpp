@@ -34,6 +34,10 @@
 #include <type_traits>
 #include <utility>
 
+#ifndef FX_SMALL_ANY_SIZE
+#define FX_SMALL_ANY_SIZE 48
+#endif
+
 namespace fx {
 
 // --- Concepts ---------------------------------------------------------------
@@ -52,6 +56,90 @@ template <Effectful E> class PerformAwaitable;
 
 namespace detail {
 struct HandlerNode; // forward declaration for Cont<E,T>
+
+// --- SmallAny: fixed-size, heap-free type-erased container ----------------
+// Per-type identity tag used by has_type<T>().
+template <typename T> inline constexpr char small_any_type_tag_v = 0;
+
+/// Fixed-size type-erased container that never heap-allocates.
+/// Types larger than N bytes or with alignment > max_align_t cause a
+/// static_assert at emplace() time.  Move-only.
+template <std::size_t N> class SmallAny {
+  alignas(std::max_align_t) std::byte buf_[N]{};
+  void (*destroy_)(void *) noexcept = nullptr;
+  void (*move_construct_)(void *dst, void *src) noexcept = nullptr;
+  const void *type_tag_ = nullptr;
+
+  void steal(SmallAny &o) noexcept {
+    if (o.destroy_) {
+      o.move_construct_(buf_, o.buf_);
+      destroy_ = o.destroy_;
+      move_construct_ = o.move_construct_;
+      type_tag_ = o.type_tag_;
+      o.destroy_ = nullptr;
+      o.move_construct_ = nullptr;
+      o.type_tag_ = nullptr;
+    }
+  }
+
+public:
+  SmallAny() noexcept = default;
+  ~SmallAny() noexcept { reset(); }
+  SmallAny(const SmallAny &) = delete;
+  SmallAny &operator=(const SmallAny &) = delete;
+  SmallAny(SmallAny &&o) noexcept { steal(o); }
+  SmallAny &operator=(SmallAny &&o) noexcept {
+    if (this != &o) { reset(); steal(o); }
+    return *this;
+  }
+
+  template <typename T>
+  void emplace(T &&val) {
+    using Tb = std::decay_t<T>;
+    static_assert(sizeof(Tb) <= N,
+        "fx::SmallAny: value too large; increase FX_SMALL_ANY_SIZE");
+    static_assert(alignof(Tb) <= alignof(std::max_align_t),
+        "fx::SmallAny: value alignment exceeds max_align_t");
+    reset();
+    ::new (static_cast<void *>(buf_)) Tb(std::forward<T>(val));
+    destroy_ = [](void *p) noexcept { std::destroy_at(static_cast<Tb *>(p)); };
+    move_construct_ = [](void *dst, void *src) noexcept {
+      ::new (dst) Tb(std::move(*static_cast<Tb *>(src)));
+      std::destroy_at(static_cast<Tb *>(src));
+    };
+    type_tag_ = &small_any_type_tag_v<Tb>;
+  }
+
+  [[nodiscard]] bool has_value() const noexcept { return destroy_ != nullptr; }
+
+  template <typename T>
+  [[nodiscard]] bool has_type() const noexcept {
+    return type_tag_ == &small_any_type_tag_v<std::decay_t<T>>;
+  }
+
+  template <typename T> T &as() noexcept {
+    return *std::launder(reinterpret_cast<T *>(buf_));
+  }
+
+  template <typename T>
+  T take() noexcept(std::is_nothrow_move_constructible_v<T>) {
+    T val = std::move(as<T>());
+    reset();
+    return val;
+  }
+
+  void reset() noexcept {
+    if (destroy_) {
+      destroy_(buf_);
+      destroy_ = nullptr;
+      move_construct_ = nullptr;
+      type_tag_ = nullptr;
+    }
+  }
+};
+
+using AnyVal = SmallAny<FX_SMALL_ANY_SIZE>;
+
 } // namespace detail
 
 /// Lightweight resume token passed to handlers instead of std::function.
@@ -85,13 +173,13 @@ template <Effectful E> struct Resume {
 /// Inherits from Resume<E> so handlers that take an explicit `Resume<E>`
 /// parameter continue to work unchanged.
 template <Effectful E, typename T> struct Cont : Resume<E> {
-  /// Transform fn: takes (ctx, std::any&&) and returns T.
-  /// The std::any carries the final result after all inner on_returns are
+  /// Transform fn: takes (ctx, AnyVal&&) and returns T.
+  /// The AnyVal carries the final result after all inner on_returns are
   /// applied.
-  using transform_fn_t = T (*)(void *, std::any &&);
+  using transform_fn_t = T (*)(void *, detail::AnyVal &&);
   /// Extract fn: pulls RawT out of the promise's result_ptr and boxes it as
-  /// std::any.
-  using extract_fn_t = std::any (*)(void *);
+  /// AnyVal.
+  using extract_fn_t = detail::AnyVal (*)(void *);
 
   explicit Cont(PerformAwaitable<E> *pa) noexcept
       : Resume<E>{pa}, transform_fn_{nullptr}, transform_ctx_{nullptr},
@@ -144,7 +232,7 @@ namespace detail {
 struct PromiseAbortBase {
   bool aborted = false;
   void *abort_owner = nullptr; // address of the handler that aborted
-  std::any abort_value;        // typed abort value, set by aborting handler
+  detail::AnyVal abort_value;  // typed abort value, set by aborting handler
 
   // Moved here from PromiseBase so that resume can reach them
   // through the non-templated abort_base_ pointer on PerformAwaitable.
@@ -167,7 +255,7 @@ struct HandlerNode {
   // Used by Cont::resume() FIFO walk: applies this handler's on_return to
   // the boxed intermediate result.  Null if the handler has no on_return or
   // is not a TypedHandler.
-  using on_return_any_fn_t = std::any (*)(void *, std::any &&);
+  using on_return_any_fn_t = AnyVal (*)(void *, AnyVal &&);
   on_return_any_fn_t on_return_any_fn = nullptr;
 };
 
@@ -543,30 +631,32 @@ using remove_effect_t = detail::fx_from_list_t<
     T, typename detail::remove_from_list<E, detail::type_list<Es...>>::type>;
 
 namespace detail {
-/// Applies H::on_return(InnerR) to a boxed std::any value, returning the
-/// result boxed as std::any.  Used by Cont::resume() FIFO walk.
+/// Applies H::on_return(InnerR) to a boxed AnyVal, returning the result
+/// boxed as AnyVal.  Used by Cont::resume() FIFO walk.
 template <typename H, typename InnerR>
-std::any on_return_any_impl(void *ctx, std::any &&val) {
+AnyVal on_return_any_impl(void *ctx, AnyVal &&val) {
   using Hb = std::remove_cvref_t<H>;
-  return std::any(
-      static_cast<Hb *>(ctx)->on_return(std::any_cast<InnerR>(std::move(val))));
+  AnyVal out;
+  out.emplace(static_cast<Hb *>(ctx)->on_return(val.template take<InnerR>()));
+  return out;
 }
 
 /// Extracts the RawT value from the promise's result_ptr (an optional<RawT>*)
-/// and returns it boxed as std::any.
-template <typename RawT> std::any extract_result_impl(void *result_ptr) {
+/// and returns it boxed as AnyVal.
+template <typename RawT> AnyVal extract_result_impl(void *result_ptr) {
   auto &opt = *static_cast<std::optional<RawT> *>(result_ptr);
-  return std::any(std::move(*opt));
+  AnyVal out;
+  out.emplace(std::move(*opt));
+  return out;
 }
 
-/// Applies H::on_return(InnerR) to a value delivered as std::any&&.
+/// Applies H::on_return(InnerR) to a value delivered as AnyVal&&.
 /// Returns on_return_t<H, InnerR>.  Used as the Cont::transform_fn_.
 template <typename H, typename InnerR>
 on_return_t<std::remove_cvref_t<H>, InnerR> apply_on_return(void *ctx,
-                                                            std::any &&val) {
+                                                            AnyVal &&val) {
   using Hb = std::remove_cvref_t<H>;
-  return static_cast<Hb *>(ctx)->on_return(
-      std::any_cast<InnerR>(std::move(val)));
+  return static_cast<Hb *>(ctx)->on_return(val.template take<InnerR>());
 }
 } // namespace detail
 
@@ -618,7 +708,7 @@ struct ScopedHandler {
           auto val = hh.handle(pa->effect_, Token{pa});
           pa->abort_base_->aborted = true;
           pa->abort_base_->abort_owner = n->handler_obj;
-          pa->abort_base_->abort_value = std::any(std::move(val));
+          pa->abort_base_->abort_value.emplace(std::move(val));
         }
       } else if constexpr (detail::HasReturnClause<std::remove_cvref_t<H>,
                                                    ResultT>) {
@@ -642,7 +732,7 @@ struct ScopedHandler {
                                      &detail::extract_result_impl<RawT>, n});
           pa->abort_base_->aborted = true;
           pa->abort_base_->abort_owner = n->handler_obj;
-          pa->abort_base_->abort_value = std::any(std::move(val));
+          pa->abort_base_->abort_value.emplace(std::move(val));
         }
       } else {
         // Plain Cont<E, ResultT> — no Koka transform.
@@ -655,7 +745,7 @@ struct ScopedHandler {
           auto val = hh.handle(pa->effect_, Token{pa});
           pa->abort_base_->aborted = true;
           pa->abort_base_->abort_owner = n->handler_obj; // = &node or group_id
-          pa->abort_base_->abort_value = std::any(std::move(val));
+          pa->abort_base_->abort_value.emplace(std::move(val));
         }
       }
     };
@@ -773,19 +863,19 @@ private:
       ab->aborted = false;
       if constexpr (detail::HasReturnClause<Hb, InnerR>) {
         // Koka path: dispatch passed Cont<E, OutT> so handle returned OutT = R.
-        // abort_value already holds R; cast directly.
-        return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+        // abort_value already holds R; extract directly.
+        return std::optional<R>{ab->abort_value.template take<R>()};
       } else if constexpr (detail::HasDrivingOperatorFor<Hb, InnerR>) {
         // Non-void handle without Koka on_return(InnerR):
         // abort_value holds DrivingR; optionally chain on_return(DrivingR).
         using DrivingR = detail::driving_return_for_t<Hb, InnerR>;
-        auto raw = std::any_cast<DrivingR>(std::move(ab->abort_value));
+        auto raw = ab->abort_value.template take<DrivingR>();
         if constexpr (detail::HasReturnClause<Hb, DrivingR>)
           return std::optional<R>{h.on_return(std::move(raw))};
         else
           return std::optional<R>{std::move(raw)};
       } else {
-        return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+        return std::optional<R>{ab->abort_value.template take<R>()};
       }
     }
     if (!inner) {
@@ -794,10 +884,9 @@ private:
       // so that on_return fires even on the abort path.
       if constexpr (detail::HasReturnClause<Hb, InnerR>) {
         if (ab && ab->aborted) {
-          try {
-            auto v = std::any_cast<InnerR>(ab->abort_value);
-            ab->abort_value = std::any(h.on_return(std::move(v)));
-          } catch (std::bad_any_cast const &) {
+          if (ab->abort_value.template has_type<InnerR>()) {
+            auto v = ab->abort_value.template take<InnerR>();
+            ab->abort_value.emplace(h.on_return(std::move(v)));
           }
         }
       }
@@ -828,7 +917,7 @@ private:
     auto *ab = get_abort_base();
     if (ab && ab->aborted && ab->abort_owner == group_id) {
       ab->aborted = false;
-      return std::optional<R>{std::any_cast<R>(std::move(ab->abort_value))};
+      return std::optional<R>{ab->abort_value.template take<R>()};
     }
     if (!inner)
       return std::nullopt;
@@ -1202,8 +1291,8 @@ T Cont<E, T>::resume(typename E::result_type v) const {
     }
     if (ab->exception)
       std::rethrow_exception(ab->exception);
-    // Extract the raw result from the promise into a std::any.
-    std::any current = extract_fn_(ab->result_ptr);
+    // Extract the raw result from the promise into an AnyVal (no heap alloc).
+    auto current = extract_fn_(ab->result_ptr);
     // Walk inner handlers (from innermost toward own_node_, exclusive) and
     // apply each one's on_return in FIFO order.
     for (auto *n = detail::stack_top; n != own_node_ && n != nullptr;
