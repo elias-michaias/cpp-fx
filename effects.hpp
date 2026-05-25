@@ -245,6 +245,11 @@ namespace detail {
 // signal abort without knowing T or Es.
 struct PromiseAbortBase {
   bool aborted = false;
+  // effect_index lives in the 7 padding bytes that follow `aborted`;
+  // no extra size added to the struct.
+  // Compile-time index of the performing effect in declared_effects — set
+  // by await_suspend so run_push() base can use O(1) table lookup.
+  uint8_t effect_index = 0;
   void *abort_owner = nullptr; // address of the handler that aborted
   detail::AnyVal abort_value;  // typed abort value, set by aborting handler
 
@@ -321,6 +326,20 @@ inline constexpr bool contains_in_list_v = false;
 template <typename T, typename... Ts>
 inline constexpr bool contains_in_list_v<T, type_list<Ts...>> =
     contains_v<T, Ts...>;
+
+// Compile-time index of T within a type_list.
+// Hard error if T is not present (no fallback base case).
+template <typename T, typename List, std::size_t I = 0>
+struct type_list_index_impl;
+template <typename T, typename U, typename... Ts, std::size_t I>
+struct type_list_index_impl<T, type_list<U, Ts...>, I>
+    : type_list_index_impl<T, type_list<Ts...>, I + 1> {};
+template <typename T, typename... Ts, std::size_t I>
+struct type_list_index_impl<T, type_list<T, Ts...>, I>
+    : std::integral_constant<std::size_t, I> {};
+template <typename T, typename List>
+inline constexpr std::size_t type_list_index_v =
+    type_list_index_impl<T, List>::value;
 
 template <typename T, typename List> struct prepend_list;
 template <typename T, typename... Ts> struct prepend_list<T, type_list<Ts...>> {
@@ -856,11 +875,36 @@ private:
   // Returns nullopt if a handler aborted (coroutine left suspended +
   // destroyed).
   std::optional<T> run_push() {
+    // Build an O(1) dispatch table: one HandlerNode* per declared effect.
+    // All handlers are on the stack at this point (pushed by recursive
+    // run_push overloads above).  Table lives on this stack frame, valid
+    // for the full coroutine drive.  effect_index (set at compile time in
+    // await_suspend) provides the O(1) index into the table per perform.
+    [[maybe_unused]] detail::HandlerNode
+        *table[sizeof...(Es) > 0 ? sizeof...(Es) : 1];
+    if constexpr (sizeof...(Es) > 0) {
+      [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+          const void *const tag = &detail::effect_tag_v<
+              std::tuple_element_t<Is, std::tuple<Es...>>>;
+          for (auto *n = detail::stack_top; n; n = n->prev)
+            if (n->effect_tag == tag) {
+              table[Is] = n;
+              break;
+            }
+        }(), ...);
+      }(std::make_index_sequence<sizeof...(Es)>{});
+    }
     auto &h = impl_.h;
     h.resume();
     while (!h.done()) {
       auto &p = h.promise();
-      detail::dispatch_effect(p.effect_tag, p.payload_ptr);
+      if constexpr (sizeof...(Es) > 0) {
+        auto *n = table[p.effect_index];
+        n->dispatch(reinterpret_cast<void *>(n), p.payload_ptr);
+      } else {
+        detail::dispatch_effect(p.effect_tag, p.payload_ptr);
+      }
       if (h.promise().aborted)
         return std::nullopt;
     }
@@ -1042,7 +1086,41 @@ private:
   using OwnedHandle = detail::OwnedHandle<promise_type>;
   OwnedHandle impl_;
 
-  void run_push() { _run(); }
+  void run_push() {
+    // Same O(1) table-dispatch logic as Fx<T>::run_push() base.
+    [[maybe_unused]] detail::HandlerNode
+        *table[sizeof...(Es) > 0 ? sizeof...(Es) : 1];
+    if constexpr (sizeof...(Es) > 0) {
+      [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+        ([&] {
+          const void *const tag = &detail::effect_tag_v<
+              std::tuple_element_t<Is, std::tuple<Es...>>>;
+          for (auto *n = detail::stack_top; n; n = n->prev)
+            if (n->effect_tag == tag) {
+              table[Is] = n;
+              break;
+            }
+        }(), ...);
+      }(std::make_index_sequence<sizeof...(Es)>{});
+    }
+    auto &h = impl_.h;
+    h.resume();
+    while (!h.done()) {
+      auto &p = h.promise();
+      if constexpr (sizeof...(Es) > 0) {
+        auto *n = table[p.effect_index];
+        n->dispatch(reinterpret_cast<void *>(n), p.payload_ptr);
+      } else {
+        detail::dispatch_effect(p.effect_tag, p.payload_ptr);
+      }
+      if (h.promise().aborted)
+        return;
+    }
+#ifndef FX_NO_EXCEPTIONS
+    if (h.promise().exception)
+      std::rethrow_exception(h.promise().exception);
+#endif
+  }
 
   template <TypedHandler H, typename... Rest>
     requires(!CompositeHandler<std::remove_cvref_t<H>>)
@@ -1245,6 +1323,10 @@ public:
     abort_base_ = &caller.promise(); // Promise inherits PromiseAbortBase
     caller.promise().effect_tag = &detail::effect_tag_v<E>;
     caller.promise().payload_ptr = this; // points into coroutine frame
+    // Store effect_index (compile-time constant) for O(1) table dispatch.
+    using Effects = typename Promise::declared_effects;
+    caller.promise().effect_index =
+        static_cast<uint8_t>(detail::type_list_index_v<E, Effects>);
   }
 
   typename E::result_type await_resume() { return std::move(result_); }
