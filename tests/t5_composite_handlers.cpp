@@ -19,31 +19,31 @@
 
 // ---- Computations ----------------------------------------------------------
 
-let greet() -> IO::Fx<std::string> {
+auto greet() -> IO::Fx<std::string> {
   perform(Log{.message = "starting greet"});
-  let name = perform(Ask{.prompt = "Name: "});
+  auto name = perform(Ask{.prompt = "Name: "});
   perform(Log{.message = "greeting " + name});
   co_return "Hello, " + name + "!";
 }
 
-let safe_div(int a, int b) -> Fail::Fx<int> {
+auto safe_div(int a, int b) -> Fail::Fx<int> {
   if (b == 0)
     co_return perform(Fail{.reason = "division by zero"});
   co_return a / b;
 }
 
-let logged_div(int a, int b) -> Row<Log, Fail>::Fx<int> {
+auto logged_div(int a, int b) -> Row<Log, Fail>::Fx<int> {
   perform(Log{.message = "div " + std::to_string(a) + "/" + std::to_string(b)});
-  let q = co_await safe_div(a, b);
+  auto q = co_await safe_div(a, b);
   perform(Log{.message = "= " + std::to_string(q)});
   co_return q;
 }
 
 // Uses Ask (×2) + Log + Fail — full All.
-let ratio() -> All::Fx<std::string> {
-  let ns = perform(Ask{.prompt = "Numerator:   "});
-  let ds = perform(Ask{.prompt = "Denominator: "});
-  let q = co_await logged_div(std::stoi(ns), std::stoi(ds));
+auto ratio() -> All::Fx<std::string> {
+  auto ns = perform(Ask{.prompt = "Numerator:   "});
+  auto ds = perform(Ask{.prompt = "Denominator: "});
+  auto q = co_await logged_div(std::stoi(ns), std::stoi(ds));
   co_return ns + "/" + ds + " = " + std::to_string(q);
 }
 
@@ -54,11 +54,11 @@ let ratio() -> All::Fx<std::string> {
 struct ScriptedIO : IO::Handler<ScriptedIO> {
   std::vector<std::string> answers;
   int idx = 0;
-  void  handle(Ask e, auto r) {
+  void handle(Ask e, auto r) {
     std::cout << e.prompt << answers[idx] << "\n";
     r(answers[idx++]);
   }
-  void  handle(Log e, auto r) {
+  void handle(Log e, auto r) {
     std::cout << "[io] " << e.message << "\n";
     r({});
   }
@@ -69,15 +69,15 @@ VALIDATE_HANDLER(ScriptedIO);
 struct ScriptedAll : All::Handler<ScriptedAll> {
   std::vector<std::string> answers;
   int idx = 0;
-  void  handle(Ask e, auto r) {
+  void handle(Ask e, auto r) {
     std::cout << e.prompt << answers[idx] << "\n";
     r(answers[idx++]);
   }
-  void  handle(Log e, auto r) {
+  void handle(Log e, auto r) {
     std::cout << "[all] " << e.message << "\n";
     r({});
   }
-  void  handle(Fail e, auto r) {
+  void handle(Fail e, auto r) {
     std::cout << "[all] FAIL: " << e.reason << " -> -1\n";
     r(-1);
   }
@@ -88,28 +88,28 @@ VALIDATE_HANDLER(ScriptedAll);
 
 int main() {
   // 1. Single composite struct covers Ask + Log — one argument to .run().
-  let r1 = greet().run(ScriptedIO{.answers = {"Alice"}});
+  auto r1 = greet().run(ScriptedIO{.answers = {"Alice"}});
   assert(r1 == "Hello, Alice!");
   std::cout << "1. ScriptedIO (composite): " << r1 << "\n";
 
   // 2. ScriptedAll covers all three effects with one .run() argument.
-  let r2 = ratio().run(ScriptedAll{.answers = {"12", "4"}});
+  auto r2 = ratio().run(ScriptedAll{.answers = {"12", "4"}});
   assert(r2 == "12/4 = 3");
   std::cout << "2. ScriptedAll (happy): " << r2 << "\n";
 
   // 3. Fail fires inside safe_div; ScriptedAll's Fail overload catches it.
-  let r3 = ratio().run(ScriptedAll{.answers = {"12", "0"}});
+  auto r3 = ratio().run(ScriptedAll{.answers = {"12", "0"}});
   assert(r3 == "12/0 = -1");
   std::cout << "3. ScriptedAll (fail): " << r3 << "\n";
 
   // 4. Mix: composite ScriptedIO (Ask+Log) + single WarnFail — two args,
   //    three effects covered.  Each handler struct remains reusable alone.
-  let r4 = ratio().run(ScriptedIO{.answers = {"8", "2"}}, WarnFail{});
+  auto r4 = ratio().run(ScriptedIO{.answers = {"8", "2"}}, WarnFail{});
   assert(r4 == "8/2 = 4");
   std::cout << "4. ScriptedIO + WarnFail (mixed): " << r4 << "\n";
 
   // 5. Fail fires, caught by the separate WarnFail handler.
-  let r5 = ratio().run(ScriptedIO{.answers = {"8", "0"}}, WarnFail{});
+  auto r5 = ratio().run(ScriptedIO{.answers = {"8", "0"}}, WarnFail{});
   assert(r5 == "8/0 = -1");
   std::cout << "5. ScriptedIO + WarnFail (fail path): " << r5 << "\n";
 
@@ -120,7 +120,7 @@ int main() {
                           ++log_count;
                           r({});
                         });
-  let r6 = greet().run(h6);
+  auto r6 = greet().run(h6);
   assert(r6 == "Hello, inline!");
   assert(log_count == 2);
   std::cout << "6. handler<IO> inline: " << r6 << " (" << log_count
@@ -132,7 +132,7 @@ int main() {
   auto io7 = handler<IO>([&](Ask, auto r) { r(std::string{in[ask_idx++]}); },
                          [](Log, auto r) { r({}); });
   auto fail7 = handler<Fail>([](Fail, auto r) { r(-1); });
-  let r7 = ratio().run(io7, fail7);
+  auto r7 = ratio().run(io7, fail7);
   assert(r7 == "6/3 = 2");
   std::cout << "7. handler<IO> + handler<Fail>: " << r7 << "\n";
 

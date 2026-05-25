@@ -19,14 +19,14 @@
 // ---- Emit-based computations -----------------------------------------------
 
 // Emits every integer in [lo, hi).
-let range(int lo, int hi) -> Emit<int>::Fx<void> {
+auto range(int lo, int hi) -> Emit<int>::Fx<void> {
   for (int i = lo; i < hi; ++i)
     perform(Emit<int>{.value = i});
 }
 
 // Emits i² and a label string for each i in [lo, hi).
 // Emit<int> and Emit<std::string> are distinct — both must be handled.
-let squares(int lo, int hi) -> Row<Emit<int>, Emit<std::string>>::Fx<void> {
+auto squares(int lo, int hi) -> Row<Emit<int>, Emit<std::string>>::Fx<void> {
   for (int i = lo; i < hi; ++i) {
     perform(Emit<int>{.value = i * i});
     perform(Emit<std::string>{.value = std::to_string(i) + "²"});
@@ -35,7 +35,7 @@ let squares(int lo, int hi) -> Row<Emit<int>, Emit<std::string>>::Fx<void> {
 
 // Logs a header, emits the range, logs a footer.
 // Emit<int> and Log propagate up together.
-let range_logged(int lo, int hi) -> Row<Emit<int>, Log>::Fx<void> {
+auto range_logged(int lo, int hi) -> Row<Emit<int>, Log>::Fx<void> {
   perform(Log{.message = "emitting [" + std::to_string(lo) + ", " +
                          std::to_string(hi) + ")"});
   co_await range(lo, hi);
@@ -43,7 +43,7 @@ let range_logged(int lo, int hi) -> Row<Emit<int>, Log>::Fx<void> {
 }
 
 // Absorbs Emit<int> locally and returns the sum.  Caller sees pure Fx<int>.
-let sum_range(int lo, int hi) -> Fx<int> {
+auto sum_range(int lo, int hi) -> Fx<int> {
   int total = 0;
   co_await handle<Emit<int>>(range(lo, hi),
                              handler<Emit<int>>([&total](Emit<int> e, auto r) {
@@ -54,7 +54,7 @@ let sum_range(int lo, int hi) -> Fx<int> {
 }
 
 // Absorbs Emit<int> locally into a vector.  Caller sees pure Fx<vector<int>>.
-let collect_range(int lo, int hi) -> Fx<std::vector<int>> {
+auto collect_range(int lo, int hi) -> Fx<std::vector<int>> {
   std::vector<int> out;
   co_await handle<Emit<int>>(range(lo, hi),
                              handler<Emit<int>>([&out](Emit<int> e, auto r) {
@@ -109,7 +109,7 @@ int main() {
             << "  (pure, no handlers)\n";
 
   // 4. collect_range: Emit<int> absorbed locally, vector returned.
-  let v4 = collect_range(3, 8).run();
+  auto v4 = collect_range(3, 8).run();
   assert((v4 == std::vector{3, 4, 5, 6, 7}));
   std::cout << "4. collect_range [3,8): size=" << v4.size() << "\n";
 

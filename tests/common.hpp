@@ -9,8 +9,6 @@
 
 using namespace fx;
 
-#define let auto
-
 // ---- Effects ---------------------------------------------------------------
 
 struct Ask : Effect<Ask> {

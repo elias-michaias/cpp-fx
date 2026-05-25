@@ -3,7 +3,7 @@
 // When a coroutine co_awaits an inner Fx, every effect performed by the
 // inner computation becomes visible in the outer function's return type.
 // The outer function does not handle those effects — it merely declares
-// them and lets them reach the top-level .run() call.
+// them and autos them reach the top-level .run() call.
 //
 // Call chain used here:
 //   ask_number          : Ask::Fx<int>
@@ -20,23 +20,23 @@
 // ---- Three-level call chain ------------------------------------------------
 
 // Level 1: leaf.  Performs a single Ask.
-let ask_number(std::string what) -> Ask::Fx<int> {
-  let s = perform(Ask{.prompt = std::move(what) + ": "});
+auto ask_number(std::string what) -> Ask::Fx<int> {
+  auto s = perform(Ask{.prompt = std::move(what) + ": "});
   co_return std::stoi(s);
 }
 
 // Level 1: leaf.  May perform Fail.
-let safe_div(int a, int b) -> Fail::Fx<int> {
+auto safe_div(int a, int b) -> Fail::Fx<int> {
   if (b == 0)
     co_return perform(Fail{.reason = "division by zero"});
   co_return a / b;
 }
 
 // Level 2: calls safe_div (Fail propagates up) and wraps it in Log.
-let logged_div(int a, int b) -> Row<Log, Fail>::Fx<int> {
+auto logged_div(int a, int b) -> Row<Log, Fail>::Fx<int> {
   perform(Log{.message =
                   "computing " + std::to_string(a) + "/" + std::to_string(b)});
-  let q = co_await safe_div(a, b);
+  auto q = co_await safe_div(a, b);
   perform(Log{.message = "result: " + std::to_string(q)});
   co_return q;
 }
@@ -44,10 +44,10 @@ let logged_div(int a, int b) -> Row<Log, Fail>::Fx<int> {
 // Level 3: calls ask_number (Ask propagates) and logged_div (Log+Fail
 // propagate). Own effect list = Ask ∪ Log ∪ Fail = All.  The caller supplies
 // all three handlers.
-let compute_ratio() -> All::Fx<std::string> {
-  let num = co_await ask_number("Numerator  ");
-  let den = co_await ask_number("Denominator");
-  let q = co_await logged_div(num, den);
+auto compute_ratio() -> All::Fx<std::string> {
+  auto num = co_await ask_number("Numerator  ");
+  auto den = co_await ask_number("Denominator");
+  auto q = co_await logged_div(num, den);
   co_return std::to_string(num) + "/" + std::to_string(den) + " = " +
       std::to_string(q);
 }
@@ -64,7 +64,7 @@ int main() {
   auto fail_neg1 = handler<Fail>([](Fail, auto r) { r(-1); });
 
   // 1. Happy path: effects from all three levels handled at the top.
-  let r1 =
+  auto r1 =
       compute_ratio().run(scripted_ask({"12", "4"}), silent_log, fail_neg1);
   assert(r1 == "12/4 = 3");
   std::cout << "1. happy path: " << r1 << "\n";
@@ -72,11 +72,11 @@ int main() {
   // 2. Fail fires inside safe_div (level 1) and propagates up two levels
   //    before the top-level handler catches it.
   std::string caught_reason;
-  let r2 = compute_ratio().run(scripted_ask({"6", "0"}), silent_log,
-                               handler<Fail>([&](Fail e, auto r) {
-                                 caught_reason = e.reason;
-                                 r(-1);
-                               }));
+  auto r2 = compute_ratio().run(scripted_ask({"6", "0"}), silent_log,
+                                handler<Fail>([&](Fail e, auto r) {
+                                  caught_reason = e.reason;
+                                  r(-1);
+                                }));
   assert(caught_reason == "division by zero");
   std::cout << "2. fail propagated: " << caught_reason << "\n";
 
@@ -100,9 +100,9 @@ int main() {
   // 4. Pure replay — deterministic test with no I/O.  Running the same
   //    computation twice with different scripted inputs gives different
   //    results.
-  let r4a =
+  auto r4a =
       compute_ratio().run(scripted_ask({"10", "2"}), silent_log, fail_neg1);
-  let r4b =
+  auto r4b =
       compute_ratio().run(scripted_ask({"7", "7"}), silent_log, fail_neg1);
   assert(r4a == "10/2 = 5");
   assert(r4b == "7/7 = 1");
