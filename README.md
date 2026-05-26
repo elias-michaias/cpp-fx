@@ -73,7 +73,7 @@ int main() {
 | [Effects & Rows](docs/effects-and-rows.md) | Defining effects, grouping them into rows, nested rows |
 | [Handlers](docs/handlers.md) | Named handlers, lambda handlers, composite handlers, `VALIDATE_HANDLER` |
 | [Propagation](docs/propagation.md) | How effects flow through `co_await` chains automatically |
-| [Composition](docs/composition.md) | `handle<E>()`, local handling, stripping effects mid-chain |
+| [Composition](docs/composition.md) | `.bind()`, local handling, stripping effects mid-chain |
 | [Validation](docs/validation.md) | Compile-time checks, IDE diagnostics, the deleted-function pattern |
 | [Performance](docs/performance.md) | Benchmark results, `ScopedAllocator`, PMR strategies, allocator guide |
 | [API Reference](docs/api-reference.md) | Complete listing of every public type, function, concept, and macro |
