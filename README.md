@@ -21,7 +21,7 @@ struct AskHandler : Handler<Ask> {
 }
 
 int main() {
-    std::cout << greet().run(AskHandler) << "\n";  // Hello, Alice!
+    std::cout << greet().run(AskHandler{}) << "\n";  // Hello, Alice!
 }
 ```
 
