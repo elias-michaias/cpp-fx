@@ -50,7 +50,7 @@ auto ratio() -> All::Fx<std::string> {
 
 // IO::Handler gives `using effect_types = type_list<Ask, Log>`.
 // D must provide  handle(Ask, ...) and  handle(Log, ...).
-struct ScriptedIO : IO::Handler {
+struct ScriptedIO : Handler<Ask, Log> {
   std::vector<std::string> answers;
   int idx = 0;
   void handle(Ask e, auto r) {
@@ -64,7 +64,7 @@ struct ScriptedIO : IO::Handler {
 };
 
 // All::Handler covers Ask + Log + Fail in a single struct.
-struct ScriptedAll : All::Handler {
+struct ScriptedAll : Handler<All> {
   std::vector<std::string> answers;
   int idx = 0;
   void handle(Ask e, auto r) {
@@ -84,14 +84,14 @@ struct ScriptedAll : All::Handler {
 // ---- Tests -----------------------------------------------------------------
 
 // Inline composite for tests 6-7: handles IO (Ask+Log) with reference state.
-struct CountingIO : IO::Handler {
+struct CountingIO : Handler<IO> {
   std::string ask_reply;
   int &log_count;
   void handle(Ask, auto r) { r(ask_reply); }
   void handle(Log, auto r) { ++log_count; r({}); }
 };
 
-struct IndexedIO : IO::Handler {
+struct IndexedIO : Handler<IO> {
   const char *const *inputs;
   int &idx;
   void handle(Ask, auto r) { r(std::string{inputs[idx++]}); }

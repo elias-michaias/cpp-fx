@@ -44,26 +44,26 @@ auto safe_div(int a, int b) -> Fail::Fx<int> {
 // ---- Named handler structs --------------------------------------------------
 
 // Always answers with the same scripted string.
-struct ScriptedAsk : Ask::Handler {
+struct ScriptedAsk : Handler<Ask> {
   std::string answer;
   void handle(Ask, auto r) { r(answer); }
 };
 
 // Counts how many times Ask fires; side-channel via reference.
-struct CountingAsk : Ask::Handler {
+struct CountingAsk : Handler<Ask> {
   int &count;
   std::string reply;
   void handle(Ask, auto r) { ++count; r(reply); }
 };
 
 // Records log messages via reference.
-struct RecordLog : Log::Handler {
+struct RecordLog : Handler<Log> {
   std::vector<std::string> &msgs;
   void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
 };
 
 // Fail handler that prints a warning then resumes with a fallback.
-struct VerboseFail : Fail::Handler {
+struct VerboseFail : Handler<Fail> {
   int fallback;
   void handle(Fail e, auto r) {
     std::cout << "   [warn] " << e.reason << "\n";

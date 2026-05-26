@@ -43,7 +43,7 @@ static auto ping_d8() -> Ping::Fx<int> {
 
 // ---- Handler ----------------------------------------------------------------
 
-struct PingHandler : Ping::Handler {
+struct PingHandler : Handler<Ping> {
   void handle(Ping, auto r) { r(1); }
 };
 

@@ -48,7 +48,7 @@ static constexpr std::size_t kArena = kFrameSlot + 65536;
 
 // ── Handler ──────────────────────────────────────────────────────────────────
 
-struct CountHandler : Tick::Handler {
+struct CountHandler : fx::Handler<Tick> {
   int n = 0;
   void handle(Tick, auto resume) { resume(n++); }
 };

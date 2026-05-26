@@ -92,12 +92,12 @@ auto prompted_div() -> IO::Fx<int> {
 
 // ---- Tests -----------------------------------------------------------------
 
-struct ScriptedAskFixed : Ask::Handler {
+struct ScriptedAskFixed : Handler<Ask> {
   std::string answer;
   void handle(Ask, auto r) { r(answer); }
 };
 
-struct RecordLog : Log::Handler {
+struct RecordLog : Handler<Log> {
   std::vector<std::string> &msgs;
   void handle(Log e, auto r) {
     msgs.push_back(e.message);
@@ -105,7 +105,7 @@ struct RecordLog : Log::Handler {
   }
 };
 
-struct IndexedAsk : Ask::Handler {
+struct IndexedAsk : Handler<Ask> {
   const char *const *inputs;
   int &idx;
   void handle(Ask, auto r) { r(std::string{inputs[idx++]}); }

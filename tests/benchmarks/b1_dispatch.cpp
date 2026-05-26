@@ -30,7 +30,7 @@ struct Increment : Effect<Increment> {
   int value;
 };
 
-struct IncrementHandler : Increment::Handler {
+struct IncrementHandler : Handler<Increment> {
   void handle(Increment e, auto r) { r(e.value + 1); }
 };
 

@@ -45,28 +45,28 @@ auto range_logged(int lo, int hi) -> Row<Emit<int>, Log>::Fx<void> {
 // ---- Handler structs --------------------------------------------------------
 
 template <typename T>
-struct CollectEmit : Emit<T>::Handler {
+struct CollectEmit : Handler<Emit<T>> {
   std::vector<T> &out;
   void handle(Emit<T> e, auto r) { out.push_back(std::move(e.value)); r({}); }
 };
 
 template <typename T>
-struct SumEmit : Emit<T>::Handler {
+struct SumEmit : Handler<Emit<T>> {
   T &total;
   void handle(Emit<T> e, auto r) { total += e.value; r({}); }
 };
 
-struct DoubleEmit : Emit<int>::Handler {
+struct DoubleEmit : Handler<Emit<int>> {
   std::vector<int> &out;
   void handle(Emit<int> e, auto r) { out.push_back(e.value * 2); r({}); }
 };
 
-struct FilterEvenEmit : Emit<int>::Handler {
+struct FilterEvenEmit : Handler<Emit<int>> {
   std::vector<int> &out;
   void handle(Emit<int> e, auto r) { if (e.value % 2 == 0) out.push_back(e.value); r({}); }
 };
 
-struct CountLog : Log::Handler {
+struct CountLog : Handler<Log> {
   int &count;
   void handle(Log, auto r) { ++count; r({}); }
 };
