@@ -1,99 +1,127 @@
 # Handlers
 
-A handler is any callable that accepts `(E effect, std::function<void(E::result_type)> resume)` and calls `resume` exactly once to provide the reply value. Three styles are supported.
+A handler is a named struct that inherits from `Handler<E>` and provides a `handle` method. The `handle` method receives the effect value and a lightweight resume token, and calls the token exactly once to supply the reply value.
 
-## Named handler struct
+## Single-effect handler
 
-Inherit from `E::Handler<Derived>` (CRTP), implement `operator()`, then call `VALIDATE_HANDLER` immediately after:
+Inherit from `Handler<E>` and implement `handle`:
 
 ```cpp
-struct StdinAsk : Ask::Handler<StdinAsk> {
-    void operator()(Ask e, auto r) {
+struct StdinAsk : Handler<Ask> {
+    void handle(Ask e, auto r) {
         std::cout << e.prompt;
         std::string s;
         std::getline(std::cin, s);
         r(s);
     }
 };
-VALIDATE_HANDLER(StdinAsk);
 ```
 
-`VALIDATE_HANDLER` fires a `static_assert` at the **definition site** (not at the first usage) if the `operator()` signature is missing or wrong. This gives an IDE squiggle on the struct immediately.
+The `auto r` parameter is a `Resume<E>` — a lightweight stack pointer token, not a `std::function`. Calling `r(value)` delivers the reply and resumes the coroutine. No heap allocation occurs for the resume callback.
 
-The `auto r` parameter type is the `std::function<void(E::result_type)>` resume callback. Using `auto` is idiomatic and keeps the signature concise.
+## Composite handler (multiple effects)
 
-## Lambda handler
-
-Wrap a lambda with `fx::handler<E>()`:
+Handle several effects in a single struct. Pass all effect types (or a row alias) to `Handler<...>`:
 
 ```cpp
-auto h = fx::handler<Ask>([](Ask e, auto r) {
-    r("Alice");
-});
-greet().run(h);
-```
-
-`handler<E>(fn)` returns a `LambdaHandler<E, F>` which satisfies `TypedHandler` — the same concept as named handler structs. Both can be passed to `.run()` interchangeably.
-
-## Composite handler (for rows)
-
-Handle all effects in a `Row` with a single struct — inherit from `Row::Handler<Derived>` and provide one `operator()` per effect:
-
-```cpp
-struct ScriptedIO : IO::Handler<ScriptedIO> {
+// explicit effect list
+struct ScriptedIO : Handler<Ask, Log> {
     std::queue<std::string> answers;
     std::vector<std::string> log;
 
-    void operator()(Ask e, auto r) { r(answers.front()); answers.pop(); }
-    void operator()(Log e, auto r) { log.push_back(e.message); r({}); }
+    void handle(Ask, auto r) { r(answers.front()); answers.pop(); }
+    void handle(Log e, auto r) { log.push_back(e.message); r({}); }
 };
-VALIDATE_HANDLER(ScriptedIO);
+
+// or via a Row alias — equivalent, effects are flattened at compile time
+struct CountingIO : Handler<IO> {   // IO = Row<Ask, Log>
+    int ask_count = 0, log_count = 0;
+    void handle(Ask, auto r) { ++ask_count; r("scripted"); }
+    void handle(Log, auto r) { ++log_count; r({}); }
+};
 ```
 
-`IO::Handler<Derived>` sets the `effect_types` alias to the full effects list of the row. `.run()` and `VALIDATE_HANDLER` use this to verify every effect has an overload.
+`Handler<IO>` and `Handler<Ask, Log>` are identical at the type level — `Row<E1,E2>` expands to its flat effect list inside `Handler`.
 
-## Inline composite handler
+## Passing handlers to `.run()`
 
-Build a composite handler on the fly from lambdas using `fx::handler<Row>(...)`:
-
-```cpp
-auto h = fx::handler<IO>(
-    [](Ask e, auto r) { r("Bob"); },
-    [](Log e, auto r) { std::cout << e.message; r({}); }
-);
-greet_logged().run(h);
-```
-
-The lambdas are matched to effects by argument type — first matching lambda wins. A compile error fires if any effect in the row has no matching lambda.
-
-## Passing multiple handlers to `.run()`
-
-`.run()` accepts any mix of single-effect handlers, composite handlers, and `LambdaHandler`s:
+`.run()` accepts any mix of single-effect and composite handlers. Every effect declared in the `Fx` type must be covered; a missing handler is a **compile error** (the `= delete` overload fires):
 
 ```cpp
-StdinAsk ask;
+StdinAsk  ask;
 StdoutLog log;
 WarnFail  fail;
 
-result = my_computation().run(ask, log, fail);
+int result = my_computation().run(ask, log, fail);
+
+// one composite handler also works
+ScriptedIO io;
+WarnFail fail;
+int result2 = my_computation().run(io, fail);
 ```
 
-Every effect declared in the `Fx` type must be covered. A missing handler is a **compile error** — the `= delete` overload of `.run()` is selected, giving an IDE squiggle at the call site.
+## Driving handlers (`on_return` and `Cont<E, T>`)
 
-## The `VALIDATE_HANDLER` macro
+A handler can transform the computation's final result by adding an `on_return` method. Returning a non-void value from `handle` (via `Cont<E, T>`) drives the coroutine to completion and receives the result.
+
+### `on_return` — result transformation
+
+`on_return(v)` is called exactly once after all `perform()` calls complete, allowing the handler to wrap or convert the result:
 
 ```cpp
-VALIDATE_HANDLER(MyHandler);
+// Converts int result to std::string on success; aborts to nullopt on Fail.
+struct FailToOpt : Handler<Fail> {
+    std::optional<int> on_return(int v) { return v; }
+    void handle(Fail, auto r) { /* abort — do not call r */ }
+};
+
+auto result = safe_div(10, 2).run(FailToOpt{});
+// result : std::optional<int>
 ```
 
-Expands to a `static_assert` that checks `TypedHandler<MyHandler> || CompositeHandler<MyHandler>`. Place it directly after the struct closing brace.
+When a handler aborts (returns without calling `r`), `on_return` is **still called** on the abort path for any outer handlers that have one, preserving FIFO composition order (see below).
 
-Works for:
-- Single-effect structs (`Effect::Handler<Derived>`)
-- Composite structs (`Row::Handler<Derived>`)
+### `Cont<E, T>` — driving handlers
 
-Does **not** work for bare lambdas — use `handler<E>(fn)` and let the `requires` clause validate at construction.
+When `handle` takes `Cont<E, T>` instead of `Resume<E>`, calling `k.resume(v)` drives the coroutine all the way to completion and returns the result `T`:
+
+```cpp
+struct AnnotatedAsk : Handler<Ask> {
+    template <typename T>
+    std::string handle(Ask e, Cont<Ask, T> k) {
+        T inner_result = k.resume("Alice");   // drives coroutine to T
+        return "result=" + std::to_string(inner_result);
+    }
+};
+// return type of .run() is std::string, not T
+```
+
+## FIFO `on_return` composition order
+
+When multiple handlers each have `on_return`, they fire **innermost-first** (FIFO from the installation order). The handler installed closest to the computation sees its `on_return` applied first; outermost handlers see the already-transformed result:
+
+```cpp
+// Inner: int → string
+struct IntToStr : Handler<Fail> {
+    std::string on_return(int v) { return std::to_string(v); }
+    void handle(Fail, auto r) { r(0); }
+};
+
+// Outer: string → pair<string, int>
+struct AddLen : Handler<Log> {
+    std::pair<std::string, int> on_return(std::string s) {
+        return {s, (int)s.size()};
+    }
+    void handle(Log, auto r) { r({}); }
+};
+
+// Chain: int → (IntToStr) → string → (AddLen) → pair<string,int>
+auto res = logged_div(10, 2).run(IntToStr{}, AddLen{});
+// res : pair<string, int>
+```
+
+This order holds on both the happy path and the abort path.
 
 ## Handler lifetime
 
-Handlers are stored by pointer on a thread-local stack inside `ScopedHandler`. They must **outlive** the `.run()` call. This is always guaranteed when passing handler objects as arguments to `.run()` (the most common pattern). When using `fx::handle<E>()` to partially handle inline, the handler is moved into a lambda that owns it.
+Handlers are stored by pointer on a thread-local stack inside `ScopedHandler`. They must **outlive** the `.run()` call. This is always satisfied when handler objects are passed directly as arguments to `.run()` or pre-bound via `.bind()` — the most common patterns.

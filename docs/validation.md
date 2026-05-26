@@ -8,15 +8,13 @@ If a coroutine tries to perform an effect that isn't in its return type, the `co
 
 ```cpp
 // WRONG
-Log::Fx<int> compute() {
+auto compute() -> Row<Log>::Fx<int> {
     auto name = perform(Ask{.prompt = "Name: "});  // ← squiggle here
     co_return 0;
 }
-// error: Ask is not in Log::Fx<int>'s effect list
+// error: Ask is not in Row<Log>::Fx<int>'s effect list
 // fix: change return type to Row<Ask, Log>::Fx<int>
 ```
-
-The deleted overload is selected eagerly by clangd, so the squiggle appears without building.
 
 ## Missing handler at `.run()` — IDE squiggle at the call site
 
@@ -25,39 +23,27 @@ The deleted overload is selected eagerly by clangd, so the squiggle appears with
 ```cpp
 Row<Ask, Log>::Fx<std::string> greet();
 
-auto ask = fx::handler<Ask>([](Ask, auto r) { r("Alice"); });
+StdinAsk ask;
 greet().run(ask);  // ← squiggle here — Log is not handled
 ```
 
-The squiggle lands on `.run(...)`, not inside the library. The fix is to add the missing handler.
+The squiggle lands on `.run(...)`, not inside the library. The fix is to add the missing handler. The same validation applies to `.bind()` — binding a handler for an effect not in the computation's list is also a compile error.
 
-## Composite handler missing an overload — `VALIDATE_HANDLER`
+## Composite handler missing a `handle` overload
 
-For handler structs, `VALIDATE_HANDLER(H)` fires a `static_assert` at the **definition site** when an `operator()` overload is missing:
+The `CompositeHandler` concept requires a `handle` overload for every effect in the handler's `effect_types` list. A missing overload is caught when the struct is first used as a handler argument to `.run()` or `.bind()`:
 
 ```cpp
-struct BadHandler : IO::Handler<BadHandler> {
-    void operator()(Ask, auto r) { r("hello"); }
-    // Log operator() missing
+struct BadHandler : Handler<Ask, Log> {
+    void handle(Ask, auto r) { r("hello"); }
+    // Log handle missing
 };
-VALIDATE_HANDLER(BadHandler);  // ← static_assert fires here
+
+compute().run(BadHandler{});  // ← compile error here
+// error: 'BadHandler' does not satisfy CompositeHandler
 ```
 
-This gives a squiggle on the macro line, pinpointing the struct rather than its first usage.
-
-## `handle<E>()` on a non-declared effect
-
-`handle<E>(comp, h)` uses the `DeclaredIn<E, F>` concept to validate that `E` appears in `comp`'s effect list:
-
-```cpp
-Fail::Fx<int> safe_div(int a, int b);
-
-// WRONG — Ask is not in Fail::Fx<int>
-auto bad = fx::handle<Ask>(safe_div(10, 2), ask_handler);
-// error: constraint 'DeclaredIn<Ask, Fail::Fx<int>>' not satisfied
-```
-
-The concept name `DeclaredIn` appears verbatim in the diagnostic, making the problem self-describing.
+The error points to the `.run()` call site. Move the struct to a `.cpp` and use it early to catch the error at definition time rather than first use.
 
 ## Inner effects not propagated
 
@@ -77,18 +63,18 @@ The `await_transform = delete` overload fires, naming the undeclared effect in t
 
 ## Handler type mismatch
 
-`HandlerFor<H, E>` uses a `requires` expression that shows the expected call shape in diagnostics:
+`HandlerFor<H, E>` uses a `requires` expression that checks for the `.handle(e, r)` method:
 
 ```cpp
-struct WrongHandler {
-    void operator()(Ask e) { /* missing resume parameter */ }
+struct WrongHandler : Handler<Ask> {
+    void handle(Ask e) { /* missing resume parameter */ }
 };
 
 greet().run(WrongHandler{});
-// error: requires (H& h, Ask e, std::function<void(std::string)> r) { h(e, r); }
+// error: requires (H& h, Ask e, Cont<Ask, int> r) { h.handle(e, r); }
 ```
 
-The requirement `{ h(e, r); }` describes exactly what signature is needed.
+The requirement describes exactly what signature is needed.
 
 ## Summary of validation sites
 
@@ -96,7 +82,7 @@ The requirement `{ h(e, r); }` describes exactly what signature is needed.
 |---------|----------------------|-----------|
 | `perform(E{})` on undeclared `E` | `perform(...)` call site | `await_transform = delete` |
 | `.run()` with missing handler | `.run(...)` call site | `run() = delete` overload |
-| Composite struct missing overload | `VALIDATE_HANDLER(H)` line | `static_assert` |
-| `handle<E>()` on non-declared `E` | `handle<E>(...)` call site | `DeclaredIn` concept |
+| Composite struct missing `handle` | `.run(...)` call site | `CompositeHandler` concept |
+| `.bind()` with wrong effect | `.bind(...)` call site | `HandlerFor` concept |
 | Inner `co_await` with undeclared effects | `co_await inner` site | `await_transform = delete` |
-| Handler wrong signature | `.run(...)` or `handler<E>(...)` | `HandlerFor` concept |
+| Handler wrong signature | `.run(...)` or `.bind(...)` | `HandlerFor` concept |

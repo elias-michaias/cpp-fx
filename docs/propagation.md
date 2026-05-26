@@ -10,18 +10,19 @@ At the **type level**, this means inner effects must be declared in every outer 
 
 ```cpp
 // inner: needs Ask
-Ask::Fx<std::string> get_name() {
+Row<Ask>::Fx<std::string> get_name() {
     co_return perform(Ask{.prompt = "Name: "});
 }
 
 // outer: co_awaits inner — must also declare Ask
-Ask::Fx<std::string> greet() {
+Row<Ask>::Fx<std::string> greet() {
     auto name = co_await get_name();  // Ask propagates up
     co_return "Hello, " + name + "!";
 }
 
 // caller supplies the Ask handler once — covers both levels
-greet().run(fx::handler<Ask>([](Ask, auto r) { r("Alice"); }));
+struct FixedAsk : Handler<Ask> { void handle(Ask, auto r) { r("Alice"); } };
+greet().run(FixedAsk{});
 ```
 
 The compiler enforces this. Trying to `co_await` an inner `Fx` whose effects are not all declared in the outer return type is a **compile error**.
@@ -50,7 +51,7 @@ Without rows, deeply nested chains would require repeating every effect:
 
 ```cpp
 // Without rows — verbose
-Fx<int, Ask, Log, Fail> deep() { ... }
+Row<Ask, Log, Fail>::Fx<int> deep() { ... }
 ```
 
 With named rows:
@@ -66,18 +67,17 @@ An outer coroutine can handle some effects locally and propagate the rest:
 
 ```cpp
 // inner needs Ask and Fail
-Row<Ask, Fail>::Fx<int> risky_query();
+auto risky_query() -> Row<Ask, Fail>::Fx<int>;
 
-// outer handles Fail locally, propagates Ask to its caller
-Ask::Fx<int> safe_query() {
-    // absorb Fail here — only Ask remains
-    auto partial = fx::handle<Fail>(risky_query(),
-                       fx::handler<Fail>([](Fail, auto r) { r(-1); }));
+// outer absorbs Fail, propagates Ask to its caller
+auto safe_query() -> Row<Ask>::Fx<int> {
+    // bind absorbs Fail; BoundFx only has Ask remaining
+    auto partial = risky_query().bind(FallbackFail{.fallback = -1});
     co_return co_await partial;
 }
 ```
 
-See [Composition](composition.md) for the full `handle<E>()` API.
+See [Composition](composition.md) for the full `.bind()` API.
 
 ## Compile-time propagation enforcement
 
@@ -85,7 +85,7 @@ Undeclared inner effects are caught at the `co_await` site:
 
 ```cpp
 // WRONG — Ask is not declared in the outer return type
-Log::Fx<int> outer() {
+auto outer() -> Row<Log>::Fx<int> {
     int n = co_await inner();  // compile error: Ask not in Log::Fx<int>
     co_return n;
 }
@@ -95,4 +95,4 @@ This fires as an IDE squiggle on the `co_await` line via the `= delete` `await_t
 
 ## Depth scaling
 
-Each level of `co_await` adds one coroutine frame allocation. Benchmarks show this scales linearly — roughly 32 ns per extra level at O3. See [Performance](performance.md) for details.
+Each level of `co_await` adds one coroutine frame allocation. Benchmarks show this scales linearly — roughly 16 ns per extra level at O3. See [Performance](performance.md) for details.
