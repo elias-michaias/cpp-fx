@@ -10,7 +10,6 @@ All benchmark source is in [`tests/benchmarks/`](../tests/benchmarks/).
 | `perform()` — single perform per coroutine | ~19 ns |
 | `perform()` — amortised over 10 000 per coroutine | ~5.8 ns |
 | Extra `co_await` level (propagation depth) | ~16 ns |
-| Per-perform heap allocation | **0 bytes** (moved to coroutine frame) |
 | Coroutine frame (once per `Fx` construction) | ~200–400 bytes |
 | With `ScopedFreeList` (best allocator strategy) | ~22 ns single / ~5 ns amortised |
 
