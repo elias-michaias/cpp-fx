@@ -63,6 +63,11 @@ namespace fx {
 template <typename E>
 concept Effectful = requires { typename E::result_type; };
 
+/// Satisfied by bare effects (`Effectful`) or row aliases (`Row<...>`).
+/// These are the only valid template arguments for `Handler<...>`.
+template <typename T>
+concept EffectOrRow = Effectful<T> || requires { typename T::effects; };
+
 // Forward-declare PerformAwaitable so Resume<E> can hold a pointer to it.
 // Full definition is in the perform() section below.
 template <Effectful E> class PerformAwaitable;
@@ -1669,6 +1674,18 @@ template <Effectful... Es> struct BasicRow {
   };
 };
 
+template <EffectOrRow... Ts>
+struct Handler {
+  using effect_types = detail::flatten_effects_t<Ts...>;
+};
+
+/// Single-effect specialization — satisfies TypedHandler so the dispatcher
+/// passes Cont<E, InnerR> (enabling Koka-style and Cont-style handles).
+template <Effectful E>
+struct Handler<E> {
+  using effect_type = E;
+};
+
 namespace detail {
 template <typename List> struct row_from_list;
 template <Effectful... Es> struct row_from_list<type_list<Es...>> {
@@ -1683,7 +1700,7 @@ using row_from_list_t = typename row_from_list<List>::type;
 ///
 ///   using IO  = Row<Ask, Log>;
 ///   using All = Row<IO, Fail>;   // flattens to BasicRow<Ask, Log, Fail>
-template <typename... Ts>
+template <EffectOrRow... Ts>
 using Row = detail::row_from_list_t<detail::flatten_effects_t<Ts...>>;
 
 template <typename H, typename E>
@@ -1719,6 +1736,10 @@ template <typename Self> struct Effect {
   struct Handler {
     using effect_type = Self;
   };
+};
+
+template <typename R> struct Effect_ {
+  using result_type = R;
 };
 
 } // namespace fx
