@@ -17,9 +17,9 @@
 #include "../common.hpp"
 
 struct IncompleteIO : IO::Handler {
-  void operator()(Ask, auto r) { r("x"); }
-  // void operator()(Log, auto r) { r({}); }   <-- intentionally missing
+  void handle(Ask, auto r) { r("x"); }
+  // void handle(Log, auto r) { r({}); }   <-- intentionally missing
 };
-VALIDATE_HANDLER(IncompleteIO);  // <-- error fires here
+VALIDATE_HANDLER(IncompleteIO); // <-- error fires here
 
 int main() {}

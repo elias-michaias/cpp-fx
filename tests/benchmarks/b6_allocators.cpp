@@ -55,7 +55,7 @@ struct CountHandler : fx::Handler<Tick> {
 
 // ── Inner coroutine ──────────────────────────────────────────────────────────
 
-static auto make_batch_coro() -> Tick::Fx<long long> {
+static auto make_batch_coro() -> fx::Row<Tick>::Fx<long long> {
   long long sum = 0;
   for (int i = 0; i < BATCH; ++i) {
     sum += perform(Tick{});
@@ -104,11 +104,12 @@ int main() {
   }
 
   // ── 3. fx::ScopedArena — stack-local monotonic buffer, reset each iter ───
-  print_result(bench("3. ScopedArena<kArena> (stack buf, reset/iter)", REPS, [&] {
-    fx::ScopedArena<kArena> arena;
-    CountHandler h;
-    do_not_optimize(make_batch_coro().run(h));
-  }));
+  print_result(
+      bench("3. ScopedArena<kArena> (stack buf, reset/iter)", REPS, [&] {
+        fx::ScopedArena<kArena> arena;
+        CountHandler h;
+        do_not_optimize(make_batch_coro().run(h));
+      }));
 
   // ── 4. PMR pool — steady-state reuse ────────────────────────────────────
   {
@@ -146,7 +147,7 @@ int main() {
 
   static constexpr int SP_REPS = 500'000;
 
-  auto sp_make = []() -> Tick::Fx<int> { co_return perform(Tick{}); };
+  auto sp_make = []() -> fx::Row<Tick>::Fx<int> { co_return perform(Tick{}); };
 
   // 0s. Global new/delete (baseline)
   {

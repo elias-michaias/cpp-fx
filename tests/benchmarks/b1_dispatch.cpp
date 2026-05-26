@@ -40,7 +40,7 @@ struct IncrementHandler : Handler<Increment> {
 
 // ---- Fx variant ------------------------------------------------------------
 
-static auto fx_inc(int x) -> Increment::Fx<int> {
+static auto fx_inc(int x) -> Row<Increment>::Fx<int> {
   co_return perform(Increment{.value = x});
 }
 
@@ -52,7 +52,8 @@ int main() {
   section("b1: per-invocation dispatch overhead  (N = " + std::to_string(N) +
           " iterations)");
   std::cout << "  Each iteration dispatches once and returns an int.\n"
-            << "  Fx: one coroutine-frame alloc per iteration; zero per-perform allocs.\n\n";
+            << "  Fx: one coroutine-frame alloc per iteration; zero "
+               "per-perform allocs.\n\n";
 
   // 1. Direct call
   {
@@ -94,7 +95,8 @@ int main() {
   }
 
   std::cout
-      << "\nNote: perform() overhead is dominated by the coroutine frame alloc.\n"
+      << "\nNote: perform() overhead is dominated by the coroutine frame "
+         "alloc.\n"
       << "      Use b2_batch to see the amortised cost across many performs.\n";
   return 0;
 }

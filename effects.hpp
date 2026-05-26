@@ -107,17 +107,19 @@ public:
   SmallAny &operator=(const SmallAny &) = delete;
   SmallAny(SmallAny &&o) noexcept { steal(o); }
   SmallAny &operator=(SmallAny &&o) noexcept {
-    if (this != &o) { reset(); steal(o); }
+    if (this != &o) {
+      reset();
+      steal(o);
+    }
     return *this;
   }
 
-  template <typename T>
-  void emplace(T &&val) {
+  template <typename T> void emplace(T &&val) {
     using Tb = std::decay_t<T>;
     static_assert(sizeof(Tb) <= N,
-        "fx::SmallAny: value too large; increase FX_SMALL_ANY_SIZE");
+                  "fx::SmallAny: value too large; increase FX_SMALL_ANY_SIZE");
     static_assert(alignof(Tb) <= alignof(std::max_align_t),
-        "fx::SmallAny: value alignment exceeds max_align_t");
+                  "fx::SmallAny: value alignment exceeds max_align_t");
     reset();
     ::new (static_cast<void *>(buf_)) Tb(std::forward<T>(val));
     destroy_ = [](void *p) noexcept { std::destroy_at(static_cast<Tb *>(p)); };
@@ -130,8 +132,7 @@ public:
 
   [[nodiscard]] bool has_value() const noexcept { return destroy_ != nullptr; }
 
-  template <typename T>
-  [[nodiscard]] bool has_type() const noexcept {
+  template <typename T> [[nodiscard]] bool has_type() const noexcept {
     return type_tag_ == &small_any_type_tag_v<std::decay_t<T>>;
   }
 
@@ -517,23 +518,24 @@ inline constexpr bool all_in_v<type_list<InnerEs...>, OuterEs...> =
     (... && contains_v<InnerEs, OuterEs...>);
 
 // True if all effects in L1 appear in L2 (both are type_lists).
-template <typename L1, typename L2>
-inline constexpr bool all_in_list_v = false;
+template <typename L1, typename L2> inline constexpr bool all_in_list_v = false;
 template <typename... InnerEs, typename... OuterEs>
-inline constexpr bool all_in_list_v<type_list<InnerEs...>, type_list<OuterEs...>> =
-    (... && contains_v<InnerEs, OuterEs...>);
+inline constexpr bool
+    all_in_list_v<type_list<InnerEs...>, type_list<OuterEs...>> =
+        (... && contains_v<InnerEs, OuterEs...>);
 
 // remaining_effects: removes from EsList all effects covered by any handler
 // in Hs...  Used by BoundFx to compute the effect_list of the bound result.
 template <typename EsList, typename... Hs> struct remaining_effects_impl;
-template <typename... Hs>
-struct remaining_effects_impl<type_list<>, Hs...> { using type = type_list<>; };
+template <typename... Hs> struct remaining_effects_impl<type_list<>, Hs...> {
+  using type = type_list<>;
+};
 template <typename E, typename... Es, typename... Hs>
 struct remaining_effects_impl<type_list<E, Es...>, Hs...> {
   static constexpr bool covered = effect_is_handled_v<E, Hs...>;
   using tail = typename remaining_effects_impl<type_list<Es...>, Hs...>::type;
-  using type = std::conditional_t<covered, tail,
-                                  typename prepend_list<E, tail>::type>;
+  using type =
+      std::conditional_t<covered, tail, typename prepend_list<E, tail>::type>;
 };
 template <typename EsList, typename... Hs>
 using remaining_effects_t =
@@ -755,8 +757,10 @@ template <typename... Es> struct PromiseBase : PromiseAbortBase {
   // effect_list (Fx<T2,InnerEs...>, BoundFx<F,Hs...>, etc.).
   // All inner effects must be declared in this coroutine's effect list.
   template <typename F>
-    requires requires { typename F::value_type; typename F::effect_list; } &&
-             all_in_list_v<typename F::effect_list, type_list<Es...>>
+    requires requires {
+      typename F::value_type;
+      typename F::effect_list;
+    } && all_in_list_v<typename F::effect_list, type_list<Es...>>
   FxAwaitable<F> await_transform(F inner) noexcept {
     return {std::move(inner)};
   }
@@ -764,8 +768,10 @@ template <typename... Es> struct PromiseBase : PromiseAbortBase {
   // Inner computation has undeclared effects — deleted for IDE squiggles.
   // To fix: add the missing effect(s) to the return type: Row<..., E>::Fx<T>.
   template <typename F>
-    requires requires { typename F::value_type; typename F::effect_list; } &&
-             (!all_in_list_v<typename F::effect_list, type_list<Es...>>)
+    requires requires {
+      typename F::value_type;
+      typename F::effect_list;
+    } && (!all_in_list_v<typename F::effect_list, type_list<Es...>>)
   FxAwaitable<F> await_transform(F) = delete;
 };
 
@@ -990,14 +996,14 @@ private:
   }
 };
 
-/// One-liner scoped arena: inline monotonic buffer + `ScopedAllocator` combined.
+/// One-liner scoped arena: inline monotonic buffer + `ScopedAllocator`
+/// combined.
 ///
 /// @code
 ///   fx::ScopedArena<4096> arena;          // 4 KiB on the stack
 ///   auto result = my_computation().run(my_handler);
 /// @endcode
-template <std::size_t N>
-class ScopedArena {
+template <std::size_t N> class ScopedArena {
   MonotonicResource<N> mr_;
   ScopedAllocator alloc_;
 
@@ -1015,8 +1021,7 @@ public:
 ///   for (auto& task : tasks) task().run(handler);   // each frame reuses pool
 ///   // pool.reset() if needed between outer loops
 /// @endcode
-template <std::size_t BlockSize, std::size_t Capacity>
-class ScopedFreeList {
+template <std::size_t BlockSize, std::size_t Capacity> class ScopedFreeList {
   FreeListResource<BlockSize, Capacity> mr_;
   ScopedAllocator alloc_;
 
@@ -1094,15 +1099,17 @@ private:
         *table[sizeof...(Es) > 0 ? sizeof...(Es) : 1];
     if constexpr (sizeof...(Es) > 0) {
       [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-        ([&] {
-          const void *const tag = &detail::effect_tag_v<
-              std::tuple_element_t<Is, std::tuple<Es...>>>;
-          for (auto *n = detail::stack_top; n; n = n->prev)
-            if (n->effect_tag == tag) {
-              table[Is] = n;
-              break;
-            }
-        }(), ...);
+        (
+            [&] {
+              const void *const tag = &detail::effect_tag_v<
+                  std::tuple_element_t<Is, std::tuple<Es...>>>;
+              for (auto *n = detail::stack_top; n; n = n->prev)
+                if (n->effect_tag == tag) {
+                  table[Is] = n;
+                  break;
+                }
+            }(),
+            ...);
       }(std::make_index_sequence<sizeof...(Es)>{});
     }
     auto &h = impl_.h;
@@ -1201,7 +1208,8 @@ private:
     auto inner =
         run_push_composite(h, group_id, typename Hb::effect_types{}, rest...);
     auto *ab = get_abort_base();
-    if (ab && ab->aborted && ab->abort_ctx && ab->abort_ctx->owner == group_id) {
+    if (ab && ab->aborted && ab->abort_ctx &&
+        ab->abort_ctx->owner == group_id) {
       ab->aborted = false;
       auto *ctx = std::exchange(ab->abort_ctx, nullptr);
       auto result = ctx->value.template take<R>();
@@ -1257,8 +1265,7 @@ public:
 
   /// Pre-bind handlers, returning a BoundFx that owns both the computation
   /// and the handlers.  Call .run(remaining...) or .bind(more...) on it.
-  template <typename... Hs>
-  auto bind(Hs &&...hs);
+  template <typename... Hs> auto bind(Hs &&...hs);
 
   // Used by FxAwaitable (co_await inner_fx inside another coroutine).
   // Runs without abort support — abort handlers must be outermost.
@@ -1306,15 +1313,17 @@ private:
         *table[sizeof...(Es) > 0 ? sizeof...(Es) : 1];
     if constexpr (sizeof...(Es) > 0) {
       [&]<std::size_t... Is>(std::index_sequence<Is...>) {
-        ([&] {
-          const void *const tag = &detail::effect_tag_v<
-              std::tuple_element_t<Is, std::tuple<Es...>>>;
-          for (auto *n = detail::stack_top; n; n = n->prev)
-            if (n->effect_tag == tag) {
-              table[Is] = n;
-              break;
-            }
-        }(), ...);
+        (
+            [&] {
+              const void *const tag = &detail::effect_tag_v<
+                  std::tuple_element_t<Is, std::tuple<Es...>>>;
+              for (auto *n = detail::stack_top; n; n = n->prev)
+                if (n->effect_tag == tag) {
+                  table[Is] = n;
+                  break;
+                }
+            }(),
+            ...);
       }(std::make_index_sequence<sizeof...(Es)>{});
     }
     auto &h = impl_.h;
@@ -1385,8 +1394,7 @@ public:
 
   /// Pre-bind handlers, returning a BoundFx that owns both the computation
   /// and the handlers.  Call .run(remaining...) or .bind(more...) on it.
-  template <typename... Hs>
-  auto bind(Hs &&...hs);
+  template <typename... Hs> auto bind(Hs &&...hs);
 
   void _run() {
     auto &h = impl_.h;
@@ -1421,18 +1429,17 @@ Fx<void, Es...> Fx<void, Es...>::promise_type::get_return_object() noexcept {
 ///   handlers (tuple is concatenated, inner Fx is moved).
 /// `._run()` — used by `co_await bound_fx` inside another coroutine; pushes
 ///   pre-bound handlers onto the thread-local stack and drives inner Fx.
-template <typename InnerFx, typename... PreHs>
-class BoundFx {
+template <typename InnerFx, typename... PreHs> class BoundFx {
   InnerFx fx_;
   std::tuple<PreHs...> pre_;
 
   // Recursive helper: push pre-bound handlers one by one, then run inner.
-  template <std::size_t I>
-  typename InnerFx::value_type _push_and_run() {
+  template <std::size_t I> typename InnerFx::value_type _push_and_run() {
     if constexpr (I == sizeof...(PreHs)) {
       return fx_._run();
     } else {
-      using H = std::remove_cvref_t<std::tuple_element_t<I, std::tuple<PreHs...>>>;
+      using H =
+          std::remove_cvref_t<std::tuple_element_t<I, std::tuple<PreHs...>>>;
       auto &h = std::get<I>(pre_);
       if constexpr (TypedHandler<H> && !CompositeHandler<H>) {
         ScopedHandler<typename H::effect_type, H> guard{h};
@@ -1488,8 +1495,7 @@ public:
   /// @endcond
 
   /// Append more pre-bound handlers; returns a new BoundFx.
-  template <typename... MoreHs>
-  auto bind(MoreHs &&...more) {
+  template <typename... MoreHs> auto bind(MoreHs &&...more) {
     return BoundFx<InnerFx, PreHs..., std::decay_t<MoreHs>...>{
         std::move(fx_),
         std::tuple_cat(std::move(pre_),
@@ -1674,15 +1680,13 @@ template <Effectful... Es> struct BasicRow {
   };
 };
 
-template <EffectOrRow... Ts>
-struct Handler {
+template <EffectOrRow... Ts> struct Handler {
   using effect_types = detail::flatten_effects_t<Ts...>;
 };
 
 /// Single-effect specialization — satisfies TypedHandler so the dispatcher
 /// passes Cont<E, InnerR> (enabling Koka-style and Cont-style handles).
-template <Effectful E>
-struct Handler<E> {
+template <Effectful E> struct Handler<E> {
   using effect_type = E;
 };
 
@@ -1709,7 +1713,7 @@ concept Handles = requires(H h, E e) {
 };
 
 template <typename H, typename E>
-requires Handles<H, E>
+  requires Handles<H, E>
 struct ValidateHandler {};
 
 /// CRTP base for a single-effect type.
@@ -1725,20 +1729,7 @@ struct ValidateHandler {};
 ///   `Ask::Fx<T>`            — coroutine return type
 ///   `Ask::Handler`           — base for handler structs
 
-template <typename Self> struct Effect {
-  template <typename T> using Fx = ::fx::Fx<T, Self>;
-
-  /// Base for single-effect handler structs.
-  ///
-  ///   struct StdinAsk : Ask::Handler {
-  ///     void handle(Ask e, auto r) { ... }
-  ///   };
-  struct Handler {
-    using effect_type = Self;
-  };
-};
-
-template <typename R> struct Effect_ {
+template <typename R> struct Effect {
   using result_type = R;
 };
 

@@ -23,7 +23,9 @@
 
 // ---- shared data generation ------------------------------------------------
 
-struct Pair { int a, b; };
+struct Pair {
+  int a, b;
+};
 
 static std::vector<Pair> make_pairs(int n, int fail_every) {
   std::vector<Pair> v;
@@ -38,15 +40,19 @@ static std::vector<Pair> make_pairs(int n, int fail_every) {
 // ---- exception-based -------------------------------------------------------
 
 [[gnu::noinline]] static int exc_div(int a, int b) {
-  if (b == 0) throw std::runtime_error("div/0");
+  if (b == 0)
+    throw std::runtime_error("div/0");
   return a / b;
 }
 
 static long long exc_sum(const std::vector<Pair> &pairs) {
   long long total = 0;
   for (auto [a, b] : pairs) {
-    try { total += exc_div(a, b); }
-    catch (...) { total -= 1; }
+    try {
+      total += exc_div(a, b);
+    } catch (...) {
+      total -= 1;
+    }
   }
   return total;
 }
@@ -54,7 +60,8 @@ static long long exc_sum(const std::vector<Pair> &pairs) {
 // ---- std::optional ---------------------------------------------------------
 
 [[gnu::noinline]] static std::optional<int> opt_div(int a, int b) {
-  if (b == 0) return std::nullopt;
+  if (b == 0)
+    return std::nullopt;
   return a / b;
 }
 
@@ -67,12 +74,14 @@ static long long opt_sum(const std::vector<Pair> &pairs) {
 
 // ---- Fail effect -----------------------------------------------------------
 
-static auto eff_div(int a, int b) -> Fail::Fx<int> {
-  if (b == 0) co_return perform(Fail{.reason = "div/0"});
+static auto eff_div(int a, int b) -> Row<Fail>::Fx<int> {
+  if (b == 0)
+    co_return perform(Fail{.reason = "div/0"});
   co_return a / b;
 }
 
-static auto eff_sum(const std::vector<Pair> &pairs) -> Fail::Fx<long long> {
+static auto eff_sum(const std::vector<Pair> &pairs)
+    -> Row<Fail>::Fx<long long> {
   long long total = 0;
   for (auto [a, b] : pairs)
     total += co_await eff_div(a, b);
@@ -86,14 +95,10 @@ static void run_trio(const char *label, const std::vector<Pair> &pairs,
   std::cout << "  " << label << "\n";
   long long sink = 0;
 
-  print_result(bench("  exceptions", reps, [&] {
-    sink += exc_sum(pairs);
-  }));
+  print_result(bench("  exceptions", reps, [&] { sink += exc_sum(pairs); }));
   do_not_optimize(sink);
 
-  print_result(bench("  std::optional", reps, [&] {
-    sink += opt_sum(pairs);
-  }));
+  print_result(bench("  std::optional", reps, [&] { sink += opt_sum(pairs); }));
   do_not_optimize(sink);
 
   print_result(bench("  Fail effect", reps, [&] {
@@ -115,19 +120,20 @@ int main() {
       << "  Each iteration sums N division results; errors replaced with -1.\n"
       << "  eff_sum co_awaits N eff_div calls inside a single coroutine.\n\n";
 
-  auto p0   = make_pairs(N, 0);   // 0% failure  — denom always non-zero
-  auto p10  = make_pairs(N, 10);  // 10% failure — every 10th is zero
-  auto p100 = make_pairs(N, 1);   // 100% failure — all denominators zero
+  auto p0 = make_pairs(N, 0);   // 0% failure  — denom always non-zero
+  auto p10 = make_pairs(N, 10); // 10% failure — every 10th is zero
+  auto p100 = make_pairs(N, 1); // 100% failure — all denominators zero
 
-  run_trio("0% failure rate (happy path only):", p0,   REPS);
-  run_trio("10% failure rate (mixed):",          p10,  REPS);
-  run_trio("100% failure rate (all errors):",    p100, REPS);
+  run_trio("0% failure rate (happy path only):", p0, REPS);
+  run_trio("10% failure rate (mixed):", p10, REPS);
+  run_trio("100% failure rate (all errors):", p100, REPS);
 
-  std::cout
-      << "Notes:\n"
-      << "  exceptions: fast on happy path; each throw is expensive.\n"
-      << "  std::optional: uniform cost regardless of failure rate.\n"
-      << "  Fail effect: also uniform; overhead is handler stack walk + resume.\n"
-      << "               propagation is automatic — no manual .value_or() needed.\n";
+  std::cout << "Notes:\n"
+            << "  exceptions: fast on happy path; each throw is expensive.\n"
+            << "  std::optional: uniform cost regardless of failure rate.\n"
+            << "  Fail effect: also uniform; overhead is handler stack walk + "
+               "resume.\n"
+            << "               propagation is automatic — no manual "
+               ".value_or() needed.\n";
   return 0;
 }

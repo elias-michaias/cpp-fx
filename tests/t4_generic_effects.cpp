@@ -19,7 +19,7 @@
 // ---- Emit-based computations -----------------------------------------------
 
 // Emits every integer in [lo, hi).
-auto range(int lo, int hi) -> Emit<int>::Fx<void> {
+auto range(int lo, int hi) -> Row<Emit<int>>::Fx<void> {
   for (int i = lo; i < hi; ++i)
     perform(Emit<int>{.value = i});
 }
@@ -44,31 +44,45 @@ auto range_logged(int lo, int hi) -> Row<Emit<int>, Log>::Fx<void> {
 
 // ---- Handler structs --------------------------------------------------------
 
-template <typename T>
-struct CollectEmit : Handler<Emit<T>> {
+template <typename T> struct CollectEmit : Handler<Emit<T>> {
   std::vector<T> &out;
-  void handle(Emit<T> e, auto r) { out.push_back(std::move(e.value)); r({}); }
+  void handle(Emit<T> e, auto r) {
+    out.push_back(std::move(e.value));
+    r({});
+  }
 };
 
-template <typename T>
-struct SumEmit : Handler<Emit<T>> {
+template <typename T> struct SumEmit : Handler<Emit<T>> {
   T &total;
-  void handle(Emit<T> e, auto r) { total += e.value; r({}); }
+  void handle(Emit<T> e, auto r) {
+    total += e.value;
+    r({});
+  }
 };
 
 struct DoubleEmit : Handler<Emit<int>> {
   std::vector<int> &out;
-  void handle(Emit<int> e, auto r) { out.push_back(e.value * 2); r({}); }
+  void handle(Emit<int> e, auto r) {
+    out.push_back(e.value * 2);
+    r({});
+  }
 };
 
 struct FilterEvenEmit : Handler<Emit<int>> {
   std::vector<int> &out;
-  void handle(Emit<int> e, auto r) { if (e.value % 2 == 0) out.push_back(e.value); r({}); }
+  void handle(Emit<int> e, auto r) {
+    if (e.value % 2 == 0)
+      out.push_back(e.value);
+    r({});
+  }
 };
 
 struct CountLog : Handler<Log> {
   int &count;
-  void handle(Log, auto r) { ++count; r({}); }
+  void handle(Log, auto r) {
+    ++count;
+    r({});
+  }
 };
 
 // ---- Local-absorbing computations ------------------------------------------
@@ -154,7 +168,8 @@ int main() {
     std::cout << " " << v;
   std::cout << "\n";
 
-  // 8. Absorb Emit<int> mid-chain from range_logged via .bind(); Log still propagates.
+  // 8. Absorb Emit<int> mid-chain from range_logged via .bind(); Log still
+  // propagates.
   //    range_logged(2,5) : Row<Emit<int>,Log>::Fx<void>
   //    .bind(CollectEmit) : BoundFx — remaining: Log
   //    .run(CountLog)     : Log handled

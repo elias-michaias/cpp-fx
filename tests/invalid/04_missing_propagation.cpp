@@ -6,7 +6,8 @@
 //   'fx::detail::FxAwaitable<...> promise_type::await_transform(IO::Fx<int>)'
 //
 //   IDE squiggle: co_await Fx<...>: inner Fx performs effects not declared
-//   here.  Fix: add the missing effect(s) to the return type: Row<...,E>::Fx<T>.
+//   here.  Fix: add the missing effect(s) to the return type:
+//   Row<...,E>::Fx<T>.
 //
 // Cause: inner_comp() returns IO::Fx<int> = Fx<int, Ask, Log>.
 // The outer function declares only Ask::Fx<int> = Fx<int, Ask>.
@@ -23,8 +24,9 @@ auto inner_comp() -> IO::Fx<int> {
 }
 
 // outer declares only Ask, but inner_comp also performs Log.
-auto outer_comp() -> Ask::Fx<int> {
-  co_return co_await inner_comp();  // <-- error: Log not declared in Ask::Fx<int>
+auto outer_comp() -> Row<Ask>::Fx<int> {
+  co_return co_await inner_comp(); // <-- error: Log not declared in
+                                   // Ask::Fx<int>
 }
 
 int main() {}

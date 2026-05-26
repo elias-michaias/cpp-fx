@@ -1,4 +1,3 @@
-CXX      = g++-15
 CXXFLAGS  = -std=c++23 -Wall -Wextra -O2
 
 SRCS = $(wildcard t*.cpp)

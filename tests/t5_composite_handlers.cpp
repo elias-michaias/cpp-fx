@@ -25,7 +25,7 @@ auto greet() -> IO::Fx<std::string> {
   co_return "Hello, " + name + "!";
 }
 
-auto safe_div(int a, int b) -> Fail::Fx<int> {
+auto safe_div(int a, int b) -> Row<Fail>::Fx<int> {
   if (b == 0)
     co_return perform(Fail{.reason = "division by zero"});
   co_return a / b;
@@ -88,7 +88,10 @@ struct CountingIO : Handler<IO> {
   std::string ask_reply;
   int &log_count;
   void handle(Ask, auto r) { r(ask_reply); }
-  void handle(Log, auto r) { ++log_count; r({}); }
+  void handle(Log, auto r) {
+    ++log_count;
+    r({});
+  }
 };
 
 struct IndexedIO : Handler<IO> {
@@ -127,7 +130,8 @@ int main() {
 
   // 6. Composite IO handler with reference-captured log count.
   int log_count = 0;
-  auto r6 = greet().run(CountingIO{.ask_reply = "inline", .log_count = log_count});
+  auto r6 =
+      greet().run(CountingIO{.ask_reply = "inline", .log_count = log_count});
   assert(r6 == "Hello, inline!");
   assert(log_count == 2);
   std::cout << "6. CountingIO (composite): " << r6 << " (" << log_count
@@ -143,7 +147,8 @@ int main() {
 
   // 8. VALIDATE_HANDLER demo — the structs above all pass.
   //    See invalid/05_incomplete_handler.cpp for the compile error case.
-  std::cout << "8. VALIDATE_HANDLER: ScriptedIO, ScriptedAll, WarnFail all OK\n";
+  std::cout
+      << "8. VALIDATE_HANDLER: ScriptedIO, ScriptedAll, WarnFail all OK\n";
 
   std::cout << "All tests passed.\n";
 }

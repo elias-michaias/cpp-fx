@@ -22,12 +22,12 @@ auto greet() -> IO::Fx<std::string> {
   co_return perform(Ask{.prompt = "Name: "});
 }
 
-struct PartialIO : IO::Handler {
+struct PartialIO : Handler<IO> {
   void handle(Ask, auto r) { r(std::string{"x"}); }
   // missing: void handle(Log, auto r) { r({}); }
 };
 // deliberately no VALIDATE_HANDLER — error surfaces at .run() instead
 
 int main() {
-  greet().run(PartialIO{});  // <-- error: Log is not handled
+  greet().run(PartialIO{}); // <-- error: Log is not handled
 }

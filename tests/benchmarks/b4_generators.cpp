@@ -45,18 +45,25 @@ template <typename T> struct Generator {
   explicit Generator(Handle h_) noexcept : h(h_) {}
   Generator(Generator &&o) noexcept : h(std::exchange(o.h, {})) {}
   Generator(const Generator &) = delete;
-  ~Generator() { if (h) h.destroy(); }
-  bool next() { h.resume(); return !h.done(); }
+  ~Generator() {
+    if (h)
+      h.destroy();
+  }
+  bool next() {
+    h.resume();
+    return !h.done();
+  }
   T value() const { return h.promise().current; }
 };
 
 static Generator<int> raw_range(int n) {
-  for (int i = 0; i < n; ++i) co_yield i;
+  for (int i = 0; i < n; ++i)
+    co_yield i;
 }
 
 // ---- Fx Emit variant -------------------------------------------------------
 
-static auto fx_range(int n) -> Emit<int>::Fx<void> {
+static auto fx_range(int n) -> Row<Emit<int>>::Fx<void> {
   for (int i = 0; i < n; ++i)
     perform(Emit<int>{.value = i});
   co_return;
@@ -66,7 +73,10 @@ static auto fx_range(int n) -> Emit<int>::Fx<void> {
 
 struct CollectInts : Handler<Emit<int>> {
   std::vector<int> &out;
-  void handle(Emit<int> e, auto r) { out.push_back(e.value); r({}); }
+  void handle(Emit<int> e, auto r) {
+    out.push_back(e.value);
+    r({});
+  }
 };
 
 // ---- main ------------------------------------------------------------------
@@ -77,8 +87,8 @@ int main() {
 
   section("b4: generators / collection  (N=" + std::to_string(N) +
           ", reps=" + std::to_string(REPS) + ")");
-  std::cout
-      << "  Each iteration generates N integers and collects them into a vector.\n\n";
+  std::cout << "  Each iteration generates N integers and collects them into a "
+               "vector.\n\n";
 
   // 1. Direct push_back — absolute baseline
   {
@@ -86,7 +96,8 @@ int main() {
     print_result(bench("direct push_back loop", REPS, [&] {
       std::vector<int> v;
       v.reserve(N);
-      for (int i = 0; i < N; ++i) v.push_back(i);
+      for (int i = 0; i < N; ++i)
+        v.push_back(i);
       sink += v.back();
     }));
     do_not_optimize(sink);
@@ -98,7 +109,8 @@ int main() {
     auto collect = [&](auto emit_fn) {
       std::vector<int> v;
       v.reserve(N);
-      for (int i = 0; i < N; ++i) emit_fn(i);
+      for (int i = 0; i < N; ++i)
+        emit_fn(i);
       sink += v.back(); // keep reference alive
       return v;
     };
@@ -117,7 +129,8 @@ int main() {
       std::vector<int> v;
       v.reserve(N);
       std::function<void(int)> emit = [&](int x) { v.push_back(x); };
-      for (int i = 0; i < N; ++i) emit(i);
+      for (int i = 0; i < N; ++i)
+        emit(i);
       sink += v.back();
     }));
     do_not_optimize(sink);
@@ -130,7 +143,8 @@ int main() {
       std::vector<int> v;
       v.reserve(N);
       auto gen = raw_range(N);
-      while (gen.next()) v.push_back(gen.value());
+      while (gen.next())
+        v.push_back(gen.value());
       sink += v.back();
     }));
     do_not_optimize(sink);
@@ -151,7 +165,8 @@ int main() {
   std::cout
       << "\nNotes:\n"
       << "  raw generator ≈ Emit<int>: both suspend/resume per value.\n"
-      << "  Emit<int> adds handler-stack walk + resume per yield (zero extra alloc).\n"
+      << "  Emit<int> adds handler-stack walk + resume per yield (zero extra "
+         "alloc).\n"
       << "  The gap vs callback = coroutine overhead.\n"
       << "  Emit<int> advantage: producer and consumer are fully decoupled;\n"
       << "  handlers are swappable without changing the producer.\n";

@@ -18,7 +18,7 @@
 
 // ---- Leaf computations -----------------------------------------------------
 
-auto ask_once(std::string prompt) -> Ask::Fx<std::string> {
+auto ask_once(std::string prompt) -> Row<Ask>::Fx<std::string> {
   co_return perform(Ask{.prompt = std::move(prompt)});
 }
 
@@ -29,7 +29,7 @@ auto ask_and_log(std::string label, std::string prompt) -> IO::Fx<std::string> {
   co_return ans;
 }
 
-auto safe_div(int a, int b) -> Fail::Fx<int> {
+auto safe_div(int a, int b) -> Row<Fail>::Fx<int> {
   if (b == 0)
     co_return perform(Fail{.reason = "division by zero"});
   co_return a / b;

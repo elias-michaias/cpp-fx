@@ -17,7 +17,7 @@
 auto meaning_of_life() -> Fx<int> { co_return 42; }
 
 // Performs a single Ask; return type declares the effect.
-auto greet() -> Ask::Fx<std::string> {
+auto greet() -> Row<Ask>::Fx<std::string> {
   auto name = perform(Ask{.prompt = "Your name: "});
   co_return "Hello, " + name + "!";
 }
@@ -35,7 +35,7 @@ auto collect(int n) -> IO::Fx<std::vector<std::string>> {
 }
 
 // Returns a / b, or performs Fail if b is zero.
-auto safe_div(int a, int b) -> Fail::Fx<int> {
+auto safe_div(int a, int b) -> Row<Fail>::Fx<int> {
   if (b == 0)
     co_return perform(Fail{.reason = "division by zero"});
   co_return a / b;
@@ -53,13 +53,19 @@ struct ScriptedAsk : Handler<Ask> {
 struct CountingAsk : Handler<Ask> {
   int &count;
   std::string reply;
-  void handle(Ask, auto r) { ++count; r(reply); }
+  void handle(Ask, auto r) {
+    ++count;
+    r(reply);
+  }
 };
 
 // Records log messages via reference.
 struct RecordLog : Handler<Log> {
   std::vector<std::string> &msgs;
-  void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
+  void handle(Log e, auto r) {
+    msgs.push_back(e.message);
+    r({});
+  }
 };
 
 // Fail handler that prints a warning then resumes with a fallback.

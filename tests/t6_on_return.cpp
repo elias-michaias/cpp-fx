@@ -36,11 +36,14 @@
 // Koka):
 //      handle produces string from int; on_return(DrivingR) chains to pair
 // 24.  Koka outer handler + inner void handle+on_return: FIFO semantics —
-//      inner on_return fires inside k.resume() before outer Koka handler sees result
-// 25.  Three-handler FIFO stack (happy path): 3 on_returns chain innermost-first
-// 26.  Three-handler FIFO stack (Fail resumption): Fail resumed, all on_returns fire
-// 27a. FIFO composition order: LogAddLarge(Log,+1000) outer, FailMul2(Fail,×2) inner
-// 27b. FIFO composition order reversed: +1000 fires before ×2 → different result
+//      inner on_return fires inside k.resume() before outer Koka handler sees
+//      result
+// 25.  Three-handler FIFO stack (happy path): 3 on_returns chain
+// innermost-first
+// 26.  Three-handler FIFO stack (Fail resumption): Fail resumed, all on_returns
+// fire 27a. FIFO composition order: LogAddLarge(Log,+1000) outer,
+// FailMul2(Fail,×2) inner 27b. FIFO composition order reversed: +1000 fires
+// before ×2 → different result
 // 28.  KokaAnnotate + LogAddLarge: inner on_return fires inside k.resume(),
 //      KokaAnnotate.handle sees already-transformed pair
 
@@ -60,7 +63,7 @@ using namespace std::string_literals;
 // ---- Computations -----------------------------------------------------------
 
 // Returns a/b, or performs Fail if b==0.
-static auto safe_div(int a, int b) -> Fail::Fx<int> {
+static auto safe_div(int a, int b) -> Row<Fail>::Fx<int> {
   if (b == 0)
     co_return perform(Fail{.reason = "div/0"});
   co_return a / b;
@@ -99,7 +102,7 @@ static auto ask_multiply(int a, int b) -> Row<Ask, Log>::Fx<int> {
 }
 
 // Performs Log n times, returns n.
-static auto multi_log(int n) -> Log::Fx<int> {
+static auto multi_log(int n) -> Row<Log>::Fx<int> {
   for (int i = 0; i < n; ++i)
     perform(Log{.message = "step " + std::to_string(i)});
   co_return n;
@@ -182,7 +185,7 @@ template <typename T> struct AskAbort : Handler<Ask> {
 // Composite handler: handles both Ask and Log, wraps int → tuple<int, string,
 // int>.
 using AskLog = Row<Ask, Log>;
-struct ScriptedAskLog : Handler<Ask, Log> {
+struct ScriptedAskLog : Handler<AskLog> {
   std::string name;
   std::vector<std::string> logs;
   void handle(Ask, auto r) { r(name); }
@@ -198,20 +201,29 @@ struct ScriptedAskLog : Handler<Ask, Log> {
 // Reference-counting Log handler for inline test assertions.
 struct CountLog : Handler<Log> {
   int &count;
-  void handle(Log, auto r) { ++count; r({}); }
+  void handle(Log, auto r) {
+    ++count;
+    r({});
+  }
 };
 
 // Reference-recording Log handler (captures log messages by ref).
 struct RecordLog : Handler<Log> {
   std::vector<std::string> &msgs;
-  void handle(Log e, auto r) { msgs.push_back(e.message); r({}); }
+  void handle(Log e, auto r) {
+    msgs.push_back(e.message);
+    r({});
+  }
 };
 
 // Reference-counting Ask handler with a fixed reply.
 struct CountAsk : Handler<Ask> {
   int &count;
   std::string reply;
-  void handle(Ask, auto r) { ++count; r(reply); }
+  void handle(Ask, auto r) {
+    ++count;
+    r(reply);
+  }
 };
 
 // ---- Tests ------------------------------------------------------------------
@@ -368,7 +380,7 @@ static void test_composite_handler_on_return() {
 //     token passed by the framework, so the handler doesn't need to know T
 //     upfront.  This enables patterns like JSON::deserialize<T>(), caching,
 //     metrics, etc. that are generic over whatever the computation returns.
-static auto prompt_length() -> Ask::Fx<int> {
+static auto prompt_length() -> Row<Ask>::Fx<int> {
   auto answer = perform(Ask{.prompt = "length of what?"});
   co_return static_cast<int>(answer.size());
 }
@@ -743,8 +755,8 @@ static void test_two_handle_on_return_compose() {
 //       Ask lambda fires once (reference-captured, observable)
 static void test_temporal_ordering_handle_before_on_return() {
   int ask_count = 0;
-  auto [val, msgs] = ask_then_multi_log(3).run(LogAccumulate{},
-                                               CountAsk{.count = ask_count, .reply = "Q"});
+  auto [val, msgs] = ask_then_multi_log(3).run(
+      LogAccumulate{}, CountAsk{.count = ask_count, .reply = "Q"});
   static_assert(std::is_same_v<decltype(val), int>);
 
   // handle × 3 then on_return × 1: on_return sees all 3 messages.
@@ -843,8 +855,8 @@ static void test_drive_stringify_type_transform() {
 static void test_fifo_on_return_inside_resume() {
   auto result = ask_then_log().run(KokaWrap{}, LogAddLarge{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
-  assert(result.first == 1005);           // LogAddLarge.on_return(5)=1005
-  assert(result.second == "len=1005");    // KokaWrap.on_return(1005)
+  assert(result.first == 1005);        // LogAddLarge.on_return(5)=1005
+  assert(result.second == "len=1005"); // KokaWrap.on_return(1005)
   PASS("24. FIFO on_return inside k.resume(): LogAddLarge fires first (+1000), "
        "KokaWrap sees 1005 → {1005,\"len=1005\"}");
 }
@@ -854,7 +866,8 @@ static void test_fifo_on_return_inside_resume() {
 // 25. Two inner void-handle+on_return handlers beneath a Koka driver.
 //     ask_then_multi_log(3): Row<Ask,Log>::Fx<int> (returns 3)
 //     run(KokaWrap{}, LogAddLarge{}, LogCount{})
-//       LogCount.on_return(3)        → pair<int,int>{3,3}  (int → pair<int,int>)
+//       LogCount.on_return(3)        → pair<int,int>{3,3}  (int →
+//       pair<int,int>)
 //       ... but LogCount returns pair<int,int>, not int, so KokaWrap needs
 //     a different setup.
 //
@@ -932,25 +945,30 @@ static auto ask_log_fail_comp(bool fail) -> Row<Ask, Log, Fail>::Fx<int> {
 //     FailAddOffset.on_return(5)=505, LogAddLarge.on_return(505)=1505,
 //     KokaWrap.on_return(1505)={1505,"len=1505"}
 static void test_fifo_three_handlers_normal_path() {
-  auto result = ask_log_fail_comp(false).run(KokaWrap{}, LogAddLarge{}, FailAddOffset{});
+  auto result =
+      ask_log_fail_comp(false).run(KokaWrap{}, LogAddLarge{}, FailAddOffset{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
   assert(result.first == 1505);
   assert(result.second == "len=1505");
-  PASS("25. FIFO 3-handler stack (happy path): FailAddOffset(+500)→LogAddLarge(+1000)"
+  PASS("25. FIFO 3-handler stack (happy path): "
+       "FailAddOffset(+500)→LogAddLarge(+1000)"
        "→KokaWrap.on_return; result={1505,\"len=1505\"}");
 }
 
 // 26. Same 3-handler stack, but the innermost (FailAddOffset) aborts via Fail.
-//     ask_log_fail_comp(true): Fail fires → FailAddOffset.handle resumes with 0.
-//     Then the computation returns 0.
-//     FIFO: FailAddOffset.on_return(0)=500, LogAddLarge.on_return(500)=1500,
+//     ask_log_fail_comp(true): Fail fires → FailAddOffset.handle resumes with
+//     0. Then the computation returns 0. FIFO: FailAddOffset.on_return(0)=500,
+//     LogAddLarge.on_return(500)=1500,
 //           KokaWrap.on_return(1500)={1500,"len=1500"}
 static void test_fifo_three_handlers_fail_resumption() {
-  auto result = ask_log_fail_comp(true).run(KokaWrap{}, LogAddLarge{}, FailAddOffset{});
+  auto result =
+      ask_log_fail_comp(true).run(KokaWrap{}, LogAddLarge{}, FailAddOffset{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
-  assert(result.first == 1500);   // FailAddOffset resumes with 0 → on_return(0)=500
+  assert(result.first ==
+         1500); // FailAddOffset resumes with 0 → on_return(0)=500
   assert(result.second == "len=1500");
-  PASS("26. FIFO 3-handler stack (Fail resumption): Fail→resume(0)→on_return(0)=500"
+  PASS("26. FIFO 3-handler stack (Fail resumption): "
+       "Fail→resume(0)→on_return(0)=500"
        "→+1000→KokaWrap; result={1500,\"len=1500\"}");
 }
 
@@ -963,7 +981,8 @@ static void test_fifo_three_handlers_fail_resumption() {
 //     FailAddOffset's InnerR = int (= T = Fx<int>'s T, same as before).
 //     LogAddLarge's InnerR = int too (same Fx<int>).
 //     FIFO walk: LogAddLarge first (+1000), then FailAddOffset (+500).
-//     ask_log_fail_comp(false): 5 → (+1000)=1005 → (+500)=1505 → {1505,"len=1505"}
+//     ask_log_fail_comp(false): 5 → (+1000)=1005 → (+500)=1505 →
+//     {1505,"len=1505"}
 //
 //     Hmm, same result.  To show ORDER matters, we need non-commutative ops.
 //     Use: OuterAdd (×2) and InnerAdd (+1000).  5→1000+5=1005→×2=2010 vs
@@ -987,17 +1006,21 @@ struct LogMul2 : Handler<Log> {
 //
 // For ask_log_fail_comp(false)=5:
 //   run(KokaWrap, LogAddLarge, FailAddOffset):
-//     walk: FailAddOffset(+500) first, LogAddLarge(+1000) second → 5+500+1000=1505
+//     walk: FailAddOffset(+500) first, LogAddLarge(+1000) second →
+//     5+500+1000=1505
 //   run(KokaWrap, FailAddOffset, LogAddLarge):
-//     walk: LogAddLarge(+1000) first, FailAddOffset(+500) second → 5+1000+500=1505
-// Both sum to 1505 (addition is commutative). Use multiply for non-commutativity:
+//     walk: LogAddLarge(+1000) first, FailAddOffset(+500) second →
+//     5+1000+500=1505
+// Both sum to 1505 (addition is commutative). Use multiply for
+// non-commutativity:
 //   FailAddOffset: +500 → result 505
 //   LogMul2: ×2 → need a handler for a DIFFERENT effect but that uses int
 //
-// Use Ask and Fail (same computation), with KokaWrap(Ask) and two inner handlers
-// FailAddOffset(Fail) and something else... but we only have Ask/Log/Fail.
-// Create AskMul3: handles Ask by resuming "hey" (3 chars), on_return(int) ×3.
-// run(KokaWrap, AskMul3, FailAddOffset) on ask_log_fail_comp:
+// Use Ask and Fail (same computation), with KokaWrap(Ask) and two inner
+// handlers FailAddOffset(Fail) and something else... but we only have
+// Ask/Log/Fail. Create AskMul3: handles Ask by resuming "hey" (3 chars),
+// on_return(int) ×3. run(KokaWrap, AskMul3, FailAddOffset) on
+// ask_log_fail_comp:
 //   Two handlers for Ask — illegal.
 //
 // The simplest non-trivial demonstration: a computation with 3 distinct effects
@@ -1017,12 +1040,14 @@ struct FailMul2 : Handler<Fail> {
 //     LogAddLarge.on_return(10) = 1010
 //     KokaWrap.on_return(1010) = {1010,"len=1010"}
 static void test_fifo_composition_order_matters_a() {
-  auto result = ask_log_fail_comp(false).run(KokaWrap{}, LogAddLarge{}, FailMul2{});
+  auto result =
+      ask_log_fail_comp(false).run(KokaWrap{}, LogAddLarge{}, FailMul2{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
   // FIFO: FailMul2(×2)=10, then LogAddLarge(+1000)=1010
   assert(result.first == 1010);
   assert(result.second == "len=1010");
-  PASS("27a. FIFO order: KokaWrap(Ask), LogAddLarge(Log,+1000), FailMul2(Fail,×2)"
+  PASS("27a. FIFO order: KokaWrap(Ask), LogAddLarge(Log,+1000), "
+       "FailMul2(Fail,×2)"
        " → ×2 fires first: 5→10→+1000=1010→{1010,\"len=1010\"}");
 }
 
@@ -1032,26 +1057,29 @@ static void test_fifo_composition_order_matters_a() {
 //     FailMul2.on_return(1005)  = 2010
 //     KokaWrap.on_return(2010)  = {2010,"len=2010"}
 static void test_fifo_composition_order_matters_b() {
-  auto result = ask_log_fail_comp(false).run(KokaWrap{}, FailMul2{}, LogAddLarge{});
+  auto result =
+      ask_log_fail_comp(false).run(KokaWrap{}, FailMul2{}, LogAddLarge{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
   // FIFO: LogAddLarge(+1000)=1005, then FailMul2(×2)=2010
   assert(result.first == 2010);
   assert(result.second == "len=2010");
-  PASS("27b. FIFO order (reversed inner pair): KokaWrap(Ask), FailMul2(Fail,×2),"
-       " LogAddLarge(Log,+1000)"
-       " → +1000 fires first: 5→1005→×2=2010→{2010,\"len=2010\"}");
+  PASS(
+      "27b. FIFO order (reversed inner pair): KokaWrap(Ask), FailMul2(Fail,×2),"
+      " LogAddLarge(Log,+1000)"
+      " → +1000 fires first: 5→1005→×2=2010→{2010,\"len=2010\"}");
 }
 
 // 28. KokaAnnotate (drives ask, re-annotates pair with prompt) + LogAddLarge.
 //     KokaAnnotate.on_return(int) → pair<int,string>{"v","len=v"}
-//     KokaAnnotate.handle(Ask e, k) → auto [n,tag]=k.resume(e.prompt) → re-annotate
-//     ask_then_log(): Row<Ask,Log>::Fx<int>
-//     run(KokaAnnotate{}, LogAddLarge{})
+//     KokaAnnotate.handle(Ask e, k) → auto [n,tag]=k.resume(e.prompt) →
+//     re-annotate ask_then_log(): Row<Ask,Log>::Fx<int> run(KokaAnnotate{},
+//     LogAddLarge{})
 //
 //     ask_then_log() with ask prompt "?", answer "?":
 //       name = "?" (1 char), int result = 1
 //     FIFO: LogAddLarge.on_return(1) = 1001
-//     KokaAnnotate sees pair {1001,"len=1001"}, re-annotates → {1001,"?:len=1001"}
+//     KokaAnnotate sees pair {1001,"len=1001"}, re-annotates →
+//     {1001,"?:len=1001"}
 static void test_fifo_koka_annotate_with_inner_on_return() {
   auto result = ask_then_log().run(KokaAnnotate{}, LogAddLarge{});
   static_assert(std::is_same_v<decltype(result), std::pair<int, std::string>>);
@@ -1061,9 +1089,9 @@ static void test_fifo_koka_annotate_with_inner_on_return() {
   assert(result.first == 1001);
   assert(result.second == "?:len=1001");
   PASS("28. KokaAnnotate+LogAddLarge FIFO: LogAddLarge fires inside resume,"
-       " KokaAnnotate sees {1001,\"len=1001\"}, re-annotates → {1001,\"?:len=1001\"}");
+       " KokaAnnotate sees {1001,\"len=1001\"}, re-annotates → "
+       "{1001,\"?:len=1001\"}");
 }
-
 
 int main() {
   std::cout << "[t6_on_return]\n";
