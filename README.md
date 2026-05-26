@@ -5,19 +5,23 @@ A single-header algebraic effects library for C++23.
 Effects let you write effectful code — I/O, failure, logging, async, generators — in a direct style, while keeping the *implementation* of those effects completely separate from the code that performs them. Handlers are swappable at the call site without changing the coroutine body.
 
 ```cpp
-struct Ask : fx::Effect<Ask> {
-    using result_type = std::string;
+struct Ask : Effect<std::string> {
     std::string prompt;
 };
 
-Ask::Fx<std::string> greet() {
+auto greet() -> Row<Ask>::Fx<std::string> {
     auto name = perform(Ask{.prompt = "Name: "});
     co_return "Hello, " + name + "!";
 }
 
+struct AskHandler : Handler<Ask> {
+    void handle(Ask e, auto r) {
+        r("Alice");
+    }
+}
+
 int main() {
-    auto h = fx::handler<Ask>([](Ask e, auto r) { r("Alice"); });
-    std::cout << greet().run(h) << "\n";  // Hello, Alice!
+    std::cout << greet().run(AskHandler) << "\n";  // Hello, Alice!
 }
 ```
 
@@ -35,13 +39,12 @@ The **return type encodes every effect the function can perform**. Handlers are 
 #include "effects.hpp"
 
 // 1. Define effects
-struct Log : fx::Effect<Log> {
-    using result_type = std::monostate;
+struct Log : Effect<std::monostate> {
     std::string message;
 };
 
 // 2. Write effectful code
-Log::Fx<int> counted_sum(int n) {
+auto counted_sum(int n) -> Row<Log>::Fx<int> {
     int total = 0;
     for (int i = 1; i <= n; ++i) {
         perform(Log{.message = "adding " + std::to_string(i)});
@@ -50,13 +53,16 @@ Log::Fx<int> counted_sum(int n) {
     co_return total;
 }
 
-// 3. Run with a handler
-int main() {
-    auto h = fx::handler<Log>([](Log e, auto r) {
+struct LogHandler : Handler<Log> {
+    void handle(Log e, auto r) {
         std::cout << e.message << "\n";
         r({});
-    });
-    int result = counted_sum(3).run(h);  // prints 3 lines, returns 6
+    }
+}
+
+// 3. Run with a handler
+int main() {
+    int result = counted_sum(3).run(LogHandler{});  // prints 3 lines, returns 6
 }
 ```
 
@@ -77,8 +83,9 @@ int main() {
 ### Effect types
 
 ```cpp
-struct Fail : fx::Effect<Fail> {
-    using result_type = int;   // the value the handler sends back
+
+// type param = the value the handler sends back
+struct Fail : Effect<int> {
     std::string reason;
 };
 ```
@@ -88,7 +95,7 @@ struct Fail : fx::Effect<Fail> {
 ```cpp
 using IO = fx::Row<Ask, Log>;
 
-IO::Fx<std::string> prompt_and_log() {
+auto prompt_and_log() -> IO::Fx<std::string> {
     perform(Log{.message = "asking"});
     auto name = perform(Ask{.prompt = "Name: "});
     co_return name;
@@ -111,28 +118,13 @@ auto result = prompt_and_log().run(ask_handler, log_handler);
 ### Named handler structs
 
 ```cpp
-struct StdinAsk : Ask::Handler<StdinAsk> {
-    void operator()(Ask e, auto r) {
+struct StdinAsk : Handler<Ask> {
+    void handle(Ask e, auto r) {
         std::cout << e.prompt;
         std::string s; std::getline(std::cin, s);
         r(s);
     }
 };
-
-// optionally validate at definition before usage
-VALIDATE_HANDLER(StdinAsk);  // error here if operator() signature is wrong
-```
-
-### Local handling with `handle<E>()`
-
-Strip a single effect without running the rest:
-
-```cpp
-// safe_div : Row<Ask, Fail>::Fx<int>
-// handle<Fail> absorbs Fail, leaving Ask::Fx<int>
-auto partial = fx::handle<Fail>(safe_div(10, 0),
-                   fx::handler<Fail>([](Fail, auto r) { r(-1); }));
-// partial is still an Ask::Fx<int> — caller must supply Ask handler
 ```
 
 ## Tests
