@@ -25,7 +25,7 @@ struct Fail : Effect<int> {
 };
 
 // Emit<T> and Emit<U> are completely separate effects — each needs its own
-// handler.  The CRTP base gives Emit<T>::Fx<R> for free.
+// handler.
 template <typename T> struct Emit : Effect<std::monostate> {
   T value;
 };
