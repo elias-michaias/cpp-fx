@@ -76,6 +76,7 @@ int main() {
 | [Composition](docs/composition.md) | `.bind()`, local handling, stripping effects mid-chain |
 | [Validation](docs/validation.md) | Compile-time checks, IDE diagnostics, the deleted-function pattern |
 | [Performance](docs/performance.md) | Benchmark results, `ScopedAllocator`, PMR strategies, allocator guide |
+| [Row Polymorphism](docs/polymorphism.md) | HOF patterns, `AnyFx`, `FxMapper`, `Rebind`, `FxOf`, `FxValue` |
 | [API Reference](docs/api-reference.md) | Complete listing of every public type, function, concept, and macro |
 
 ## Overview
