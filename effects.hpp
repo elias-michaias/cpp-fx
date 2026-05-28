@@ -1733,6 +1733,77 @@ template <typename R> struct Effect {
   using result_type = R;
 };
 
+// ── Fx type utilities ─────────────────────────────────────────────────────────
+// Three tools for writing row-polymorphic higher-order functions.
+// All work with any Fx<T, Es...> instantiation, including Row<Es...>::Fx<T>
+// aliases (which expand to the same type).
+
+/// Satisfied by any Fx<T, Es...> instantiation.
+/// Use to constrain an HOF template parameter to "must be a computation":
+///
+///   template<fx::AnyFx F>
+///   auto wrap(F comp) -> fx::Rebind<F, std::string>;
+template <typename T>
+concept AnyFx = requires {
+  typename T::value_type;
+  typename T::effect_list;
+};
+
+/// Satisfied when F(T) returns some Fx type.
+/// Replaces a default template argument in HOFs whose effect row should flow
+/// from a function parameter rather than a direct Fx argument:
+///
+///   // Without FxMapper: 3 template params
+///   template<typename T, typename F, typename FxB = std::invoke_result_t<F,T>>
+///   auto filter_fx(std::vector<T> xs, F pred) -> fx::Rebind<FxB, std::vector<T>>;
+///
+///   // With FxMapper: 2 template params, constraint is self-documenting
+///   template<typename T, fx::FxMapper<T> F>
+///   auto filter_fx(std::vector<T> xs, F pred)
+///       -> fx::Rebind<std::invoke_result_t<F, T>, std::vector<T>>;
+template <typename F, typename T>
+concept FxMapper = AnyFx<std::invoke_result_t<F, T>>;
+
+namespace detail {
+template <typename FxT, typename NewT> struct RebindImpl;
+template <typename OldT, typename NewT, Effectful... Es>
+struct RebindImpl<Fx<OldT, Es...>, NewT> { using type = Fx<NewT, Es...>; };
+} // namespace detail
+
+/// Rebinds the value type of Fx<OldT, Es...> to NewT, keeping Es... intact.
+/// This is the one operation on Fx rows that cannot be expressed without a
+/// partial specialisation — everything else (widening, extension, constraints)
+/// falls out of plain Fx<T, Es...> decomposition in the template parameter.
+///
+///   Rebind<Fx<bool, Ask>, std::vector<int>>  ==  Fx<std::vector<int>, Ask>
+///
+///   template<typename T, fx::FxMapper<T> F>
+///   auto filter_fx(std::vector<T> xs, F pred)
+///       -> fx::Rebind<std::invoke_result_t<F, T>, std::vector<T>>;
+template <AnyFx FxT, typename NewT>
+using Rebind = typename detail::RebindImpl<FxT, NewT>::type;
+
+/// The Fx type that F produces when called with T.
+/// Shorthand for std::invoke_result_t<F, T>, constrained by FxMapper<F, T>.
+/// Pair with FxValue to write list-map HOFs without extra template parameters:
+///
+///   template<typename T, fx::FxMapper<T> F>
+///   auto fmap_list(std::vector<T> xs, F f)
+///       -> fx::Rebind<fx::FxOf<F, T>, std::vector<fx::FxValue<F, T>>>;
+template <typename F, typename T>
+  requires FxMapper<F, T>
+using FxOf = std::invoke_result_t<F, T>;
+
+/// The value type inside FxOf<F, T>  (i.e. FxOf<F,T>::value_type).
+/// Use when the element type of the output container differs from T:
+///
+///   fmap_list : std::vector<T> × (T → Fx<U,Es...>) → Fx<std::vector<U>,Es...>
+///               ^                                           ^
+///               T stays T                                  U = FxValue<F, T>
+template <typename F, typename T>
+  requires FxMapper<F, T>
+using FxValue = typename std::invoke_result_t<F, T>::value_type;
+
 } // namespace fx
 
 /// Raises effect `e` inside a coroutine and suspends until a handler resumes
