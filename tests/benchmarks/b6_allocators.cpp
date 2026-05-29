@@ -1,20 +1,4 @@
-// b6_allocators.cpp — coroutine frame allocation strategies
-//
-// Per-perform Payload allocation no longer exists: perform() stores all
-// per-effect state inline in PerformAwaitable on the coroutine frame.
-//
-// The only remaining hot allocation site is:
-//
-//   • Coroutine frame  — one allocation when the Fx<T> is constructed.
-//
-// This benchmark compares frame-allocation strategies:
-//
-//  0. Global operator new / delete  (explicit baseline)
-//  1. Default (TLS fx::FreeListResource<256,16> — zero annotation)
-//  2. PMR monotonic_buffer_resource backed by a heap buffer (reset per iter)
-//  3. fx::ScopedArena — stack-local monotonic buffer (reset per iter)
-//  4. PMR unsynchronized_pool_resource (steady-state block reuse)
-//  5. fx::ScopedFreeList — O(1) free-list pool
+
 
 #include "../../effects.hpp"
 #include "bench.hpp"
@@ -23,37 +7,30 @@
 #include <memory_resource>
 #include <vector>
 
-// ── Effect under test ────────────────────────────────────────────────────────
 
 struct Tick : fx::Effect<Tick> {
   using result_type = int;
 };
 
-// ── Frame size constants ─────────────────────────────────────────────────────
 
-// Rough upper bound on a coroutine frame for Tick::Fx<long long>.
-// Actual size is compiler-dependent (~200-400 bytes); 512 is safe.
 static constexpr std::size_t kFrameEst = 512;
 
-// One extra pointer stored after the frame by PromiseBase::operator new.
+
 static constexpr std::size_t kFrameSlot = kFrameEst + sizeof(void *);
 
-// ── Benchmark parameters ─────────────────────────────────────────────────────
 
 static constexpr int BATCH = 5'000; // performs per coroutine
-static constexpr int REPS = 2'000;  // coroutine invocations
+static constexpr int REPS = 2'000;
 
-// Arena must hold one frame per invocation (performs are zero-alloc now).
+
 static constexpr std::size_t kArena = kFrameSlot + 65536;
 
-// ── Handler ──────────────────────────────────────────────────────────────────
 
 struct CountHandler : fx::Handler<Tick> {
   int n = 0;
   void handle(Tick, auto resume) { resume(n++); }
 };
 
-// ── Inner coroutine ──────────────────────────────────────────────────────────
 
 static auto make_batch_coro() -> fx::Row<Tick>::Fx<long long> {
   long long sum = 0;
@@ -63,7 +40,6 @@ static auto make_batch_coro() -> fx::Row<Tick>::Fx<long long> {
   co_return sum;
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────────
 
 int main() {
   section("b6 — Coroutine frame allocator strategies");
@@ -76,7 +52,7 @@ int main() {
 
   section("Batch cost (per-coroutine ns)");
 
-  // ── 0. Explicit global new/delete (baseline) ────────────────────────────
+
   {
     fx::ScopedAllocator alloc{std::pmr::new_delete_resource()};
     print_result(bench("0. Global new/delete (baseline)", REPS, [&] {
@@ -85,13 +61,13 @@ int main() {
     }));
   }
 
-  // ── 1. Default (TLS free-list slab — zero annotation) ───────────────────
+
   print_result(bench("1. Default (TLS slab)", REPS, [&] {
     CountHandler h;
     do_not_optimize(make_batch_coro().run(h));
   }));
 
-  // ── 2. PMR monotonic — heap buffer, reset each iter ─────────────────────
+
   {
     std::vector<std::byte> buf(kArena);
     print_result(bench("2. Monotonic (heap buf, reset/iter)", REPS, [&] {
@@ -103,7 +79,7 @@ int main() {
     }));
   }
 
-  // ── 3. fx::ScopedArena — stack-local monotonic buffer, reset each iter ───
+
   print_result(
       bench("3. ScopedArena<kArena> (stack buf, reset/iter)", REPS, [&] {
         fx::ScopedArena<kArena> arena;
@@ -111,7 +87,7 @@ int main() {
         do_not_optimize(make_batch_coro().run(h));
       }));
 
-  // ── 4. PMR pool — steady-state reuse ────────────────────────────────────
+
   {
     std::vector<std::byte> pbuf(kArena);
     std::pmr::monotonic_buffer_resource backing{
@@ -125,7 +101,7 @@ int main() {
     }));
   }
 
-  // ── 5. fx::ScopedFreeList — O(1) free-list pool ──────────────────────────
+
   {
     fx::ScopedFreeList<kFrameSlot, 4> pool;
     print_result(bench("5. ScopedFreeList (O(1) pool)", REPS, [&] {
@@ -135,14 +111,14 @@ int main() {
     }));
   }
 
-  // ── Per-perform breakdown ────────────────────────────────────────────────
+
   section("Per-perform cost (÷ " + std::to_string(BATCH) + ")");
   std::cout
       << "  Per-perform payload alloc: ZERO (stored in coroutine frame)\n";
   std::cout << "  (Divide per-coroutine ns above by " << BATCH
             << " for residual per-perform overhead.)\n";
 
-  // ── Single-perform worst case ────────────────────────────────────────────
+
   section("Single-perform coroutine (worst-case frame amortisation)");
 
   static constexpr int SP_REPS = 500'000;

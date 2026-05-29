@@ -1,32 +1,16 @@
-// b2_batch.cpp — amortised per-perform cost
-//
-// A single Fx coroutine that performs N effects amortises the one-time
-// coroutine-frame allocation across all N performs.  This benchmark isolates
-// the per-perform cost (handler dispatch + resume) from the
-// per-coroutine cost (frame alloc) measured in b1_dispatch.
-// Per-perform payload allocation is zero — effect state lives on the frame.
-//
-// Comparisons:
-//   1. Direct tight loop (baseline — no indirection)
-//   2. std::function called N times per outer iteration
-//   3. fx::perform called N times inside one coroutine
-//
-// The "ns per perform" row at the bottom divides the Fx result by BATCH to
-// give a fair per-call comparison against the others.
+
 
 #include "../common.hpp"
 #include "bench.hpp"
 
 #include <functional>
 
-// ---- effect ----------------------------------------------------------------
 
 struct Tick : Effect<Tick> {
   using result_type = int;
-  // No payload — just a counter tick.
+
 };
 
-// ---- Fx computation: sum BATCH ticks ---------------------------------------
 
 static auto sum_ticks(int n) -> Row<Tick>::Fx<long long> {
   long long total = 0;
@@ -40,11 +24,10 @@ struct TickCounter : Handler<Tick> {
   void handle(Tick, auto r) { r(++counter); }
 };
 
-// ---- main ------------------------------------------------------------------
 
 int main() {
   constexpr int BATCH = 10'000;       // performs per outer iteration
-  constexpr std::size_t REPS = 2'000; // outer iterations
+  constexpr std::size_t REPS = 2'000;
 
   section("b2: amortised per-perform cost  (batch=" + std::to_string(BATCH) +
           ", reps=" + std::to_string(REPS) + ")");
@@ -54,7 +37,7 @@ int main() {
 
   BenchResult direct_r, stdfn_r, fx_r;
 
-  // 1. Direct loop
+
   {
     long long sink = 0;
     int counter = 0;
@@ -68,7 +51,7 @@ int main() {
     do_not_optimize(sink);
   }
 
-  // 2. std::function loop
+
   {
     long long sink = 0;
     int counter = 0;
@@ -83,7 +66,7 @@ int main() {
     do_not_optimize(sink);
   }
 
-  // 3. fx::perform loop (one coroutine, BATCH performs)
+
   {
     long long sink = 0;
     int counter = 0;
@@ -94,7 +77,7 @@ int main() {
     do_not_optimize(sink);
   }
 
-  // Derived: ns per individual perform call
+
   std::cout << "\n  --- amortised per-call breakdown ---\n";
   auto per = [&](const BenchResult &r) { return r.ns_per_iter() / BATCH; };
   std::cout << "  " << std::setw(44) << std::left << "direct loop  (per call)"

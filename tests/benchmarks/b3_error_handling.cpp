@@ -1,18 +1,4 @@
-// b3_error_handling.cpp — error propagation strategies
-//
-// Compares three strategies for propagating errors through a computation:
-//
-//   1. C++ exceptions     — zero-cost on happy path; expensive at throw site
-//   2. std::optional<T>   — explicit propagation; branch per call
-//   3. Fail effect        — algebraic; automatic propagation; handler at top
-//
-// Scenario: divide N numbers, ~FAIL_PCT% have denominator 0.
-// Each strategy substitutes -1 for the failure value and sums all results.
-//
-// Three sub-benchmarks per strategy:
-//   a. 0% failure   — all happy path
-//   b. 10% failure  — realistic mixed workload
-//   c. 100% failure — stress the error path
+
 
 #include "../common.hpp"
 #include "bench.hpp"
@@ -21,7 +7,6 @@
 #include <stdexcept>
 #include <vector>
 
-// ---- shared data generation ------------------------------------------------
 
 struct Pair {
   int a, b;
@@ -37,7 +22,6 @@ static std::vector<Pair> make_pairs(int n, int fail_every) {
   return v;
 }
 
-// ---- exception-based -------------------------------------------------------
 
 [[gnu::noinline]] static int exc_div(int a, int b) {
   if (b == 0)
@@ -57,7 +41,6 @@ static long long exc_sum(const std::vector<Pair> &pairs) {
   return total;
 }
 
-// ---- std::optional ---------------------------------------------------------
 
 [[gnu::noinline]] static std::optional<int> opt_div(int a, int b) {
   if (b == 0)
@@ -72,7 +55,6 @@ static long long opt_sum(const std::vector<Pair> &pairs) {
   return total;
 }
 
-// ---- Fail effect -----------------------------------------------------------
 
 static auto eff_div(int a, int b) -> Row<Fail>::Fx<int> {
   if (b == 0)
@@ -88,7 +70,6 @@ static auto eff_sum(const std::vector<Pair> &pairs)
   co_return total;
 }
 
-// ---- helper ----------------------------------------------------------------
 
 static void run_trio(const char *label, const std::vector<Pair> &pairs,
                      std::size_t reps) {
@@ -108,7 +89,6 @@ static void run_trio(const char *label, const std::vector<Pair> &pairs,
   std::cout << "\n";
 }
 
-// ---- main ------------------------------------------------------------------
 
 int main() {
   constexpr int N = 5'000;

@@ -1,27 +1,13 @@
-// b5_propagation.cpp — call-chain depth scaling
-//
-// When a coroutine co_awaits another Fx, the inner computation runs
-// synchronously (await_ready returns true) so there is no actual suspension —
-// but each level still allocates a coroutine frame.
-//
-// This benchmark measures how total cost scales with chain depth by running:
-//   - a single perform at the bottom of a 1 / 3 / 5 / 8-level chain
-//   - the equivalent direct (non-coroutine) call chain for comparison
-//
-// Expected: each additional co_await level adds one coroutine frame alloc
-// and one resume() call.  If the allocator is warm the increment is small
-// and roughly linear in depth.
+
 
 #include "../common.hpp"
 #include "bench.hpp"
 
-// ---- effect ----------------------------------------------------------------
 
 struct Ping : Effect<Ping> {
   using result_type = int;
 };
 
-// ---- Fx chains (depth 1 … 8) -----------------------------------------------
 
 static auto ping_d1() -> Row<Ping>::Fx<int> { co_return perform(Ping{}); }
 static auto ping_d2() -> Row<Ping>::Fx<int> { co_return co_await ping_d1(); }
@@ -32,7 +18,6 @@ static auto ping_d8() -> Row<Ping>::Fx<int> {
   co_return co_await ping_d5() + co_await ping_d3();
 }
 
-// ---- Direct equivalents (same depth, no coroutines) ------------------------
 
 [[gnu::noinline]] static int direct_d1() { return 1; }
 [[gnu::noinline]] static int direct_d2() { return direct_d1(); }
@@ -41,13 +26,11 @@ static auto ping_d8() -> Row<Ping>::Fx<int> {
 [[gnu::noinline]] static int direct_d5() { return direct_d4(); }
 [[gnu::noinline]] static int direct_d8() { return direct_d5() + direct_d3(); }
 
-// ---- Handler ----------------------------------------------------------------
 
 struct PingHandler : Handler<Ping> {
   void handle(Ping, auto r) { r(1); }
 };
 
-// ---- main ------------------------------------------------------------------
 
 int main() {
   constexpr std::size_t N = 500'000;
