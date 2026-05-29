@@ -53,8 +53,11 @@ private:
   }
 
   void steal(SmallAny &o) noexcept {
-    if (o.destroy_) {
-      o.move_construct_(buf_, o.buf_);
+    if (o.type_tag_) {
+      if (o.move_construct_)
+        o.move_construct_(buf_, o.buf_);
+      else
+        __builtin_memcpy(buf_, o.buf_, N);
       destroy_ = o.destroy_;
       move_construct_ = o.move_construct_;
       type_tag_ = o.type_tag_;
@@ -76,7 +79,8 @@ public:
     return *this;
   }
 
-  template <typename T> void emplace(T &&val) {
+  template <typename T>
+  [[gnu::always_inline]] void emplace(T &&val) {
     using Tb = std::decay_t<T>;
     static_assert(sizeof(Tb) <= N,
                   "fx::SmallAny: value too large; increase FX_SMALL_ANY_SIZE");
@@ -84,12 +88,14 @@ public:
                   "fx::SmallAny: value alignment exceeds max_align_t");
     reset();
     ::new (static_cast<void *>(buf_)) Tb(std::forward<T>(val));
-    destroy_ = &destroy_fn<Tb>;
-    move_construct_ = &move_fn<Tb>;
+    if constexpr (!std::is_trivially_destructible_v<Tb>)
+      destroy_ = &destroy_fn<Tb>;
+    if constexpr (!std::is_trivially_copyable_v<Tb>)
+      move_construct_ = &move_fn<Tb>;
     type_tag_ = &small_any_type_tag_v<Tb>;
   }
 
-  [[nodiscard]] bool has_value() const noexcept { return destroy_ != nullptr; }
+  [[nodiscard]] bool has_value() const noexcept { return type_tag_ != nullptr; }
 
   template <typename T> [[nodiscard]] bool has_type() const noexcept {
     return type_tag_ == &small_any_type_tag_v<std::decay_t<T>>;
@@ -100,15 +106,15 @@ public:
   }
 
   template <typename T>
-  T take() noexcept(std::is_nothrow_move_constructible_v<T>) {
+  [[gnu::always_inline]] T take() noexcept(std::is_nothrow_move_constructible_v<T>) {
     T val = std::move(as<T>());
     reset();
     return val;
   }
 
   void reset() noexcept {
-    if (destroy_) {
-      destroy_(buf_);
+    if (type_tag_) {
+      if (destroy_) destroy_(buf_);
       destroy_ = nullptr;
       move_construct_ = nullptr;
       type_tag_ = nullptr;
@@ -241,19 +247,13 @@ struct PromiseAbortBase {
 
 struct HandlerNode {
   const void *effect_tag = nullptr;
-  void *handler_obj = nullptr;
-
-  void *real_handler_ptr =
-      nullptr;
-  void (*dispatch)(void *node_self, void *payload) = nullptr;
   HandlerNode *prev = nullptr;
-
-
+  bool (*dispatch)(HandlerNode *, void *) noexcept = nullptr;
+  void *handler_obj = nullptr;
+  void *real_handler_ptr = nullptr;
   using on_return_any_fn_t = AnyVal (*)(void *, AnyVal &&);
   on_return_any_fn_t on_return_any_fn = nullptr;
-
-
-  AbortContext abort_storage;
+  AbortContext *abort_ctx_ptr = nullptr;
 };
 
 #ifdef FX_NO_TLS
@@ -274,20 +274,18 @@ inline thread_local std::pmr::memory_resource *current_mr = nullptr;
 template <Effectful E> inline constexpr char effect_tag_v = 0;
 
 
-inline void dispatch_effect(const void *tag, void *payload_ptr) {
+[[gnu::always_inline]] inline bool dispatch_effect(const void *tag, void *payload_ptr) noexcept {
   for (auto *n = stack_top; n; n = n->prev) {
-    if (n->effect_tag == tag) {
-      n->dispatch(reinterpret_cast<void *>(n), payload_ptr);
-      return;
-    }
+    if (n->effect_tag == tag) [[likely]]
+      return n->dispatch(n, payload_ptr);
   }
   std::terminate();
 }
 
 
 template <Effectful... Es, typename Handle>
-bool run_coroutine(Handle &h) {
-  [[maybe_unused]] HandlerNode *table[sizeof...(Es) > 0 ? sizeof...(Es) : 1];
+[[gnu::always_inline]] inline bool run_coroutine(Handle &h) noexcept {
+  [[maybe_unused]] HandlerNode *table[sizeof...(Es) > 0 ? sizeof...(Es) : 1]{};
   if constexpr (sizeof...(Es) > 0) {
     [&]<std::size_t... Is>(std::index_sequence<Is...>) {
       (
@@ -304,16 +302,14 @@ bool run_coroutine(Handle &h) {
     }(std::make_index_sequence<sizeof...(Es)>{});
   }
   h.resume();
-  while (!h.done()) {
-    auto &p = h.promise();
+  auto &p = h.promise();
+  while (__builtin_expect(!h.done(), 1)) {
     if constexpr (sizeof...(Es) > 0) {
       auto *n = table[p.effect_index];
-      n->dispatch(reinterpret_cast<void *>(n), p.payload_ptr);
+      if (n->dispatch(n, p.payload_ptr)) return true;
     } else {
-      dispatch_effect(p.effect_tag, p.payload_ptr);
+      if (dispatch_effect(p.effect_tag, p.payload_ptr)) return true;
     }
-    if (h.promise().aborted)
-      return true;
   }
   return false;
 }
@@ -773,22 +769,22 @@ template <Effectful E, typename H, typename ResultT = void,
 struct ScopedHandler {
   detail::HandlerNode node;
   detail::HandlerNode *saved;
+  detail::AbortContext abort_storage_;
 
-  explicit ScopedHandler(H &h, void *group_id = nullptr) {
+  explicit ScopedHandler(H &h, void *group_id = nullptr) noexcept {
     node.effect_tag = &detail::effect_tag_v<E>;
     node.real_handler_ptr = static_cast<void *>(&h);
 
 
     node.handler_obj = group_id ? group_id : static_cast<void *>(&node);
-
+    node.abort_ctx_ptr = &abort_storage_;
 
     if constexpr (!std::is_void_v<ResultT> &&
                   detail::HasReturnClause<std::remove_cvref_t<H>, ResultT>) {
       node.on_return_any_fn =
           &detail::on_return_any_impl<std::remove_cvref_t<H>, ResultT>;
     }
-    node.dispatch = [](void *node_self, void *raw) {
-      auto *n = reinterpret_cast<detail::HandlerNode *>(node_self);
+    node.dispatch = [](detail::HandlerNode *n, void *raw) noexcept -> bool {
       auto &hh =
           *reinterpret_cast<std::remove_reference_t<H> *>(n->real_handler_ptr);
       auto *pa = reinterpret_cast<PerformAwaitable<E> *>(raw);
@@ -799,12 +795,14 @@ struct ScopedHandler {
         using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
         if constexpr (std::is_void_v<Ret>) {
           hh.handle(pa->effect_, Token{pa});
+          return false;
         } else {
           auto val = hh.handle(pa->effect_, Token{pa});
-          n->abort_storage.owner = n->handler_obj;
-          n->abort_storage.value.emplace(std::move(val));
-          pa->abort_base_->abort_ctx = &n->abort_storage;
+          n->abort_ctx_ptr->owner = n->handler_obj;
+          n->abort_ctx_ptr->value.emplace(std::move(val));
+          pa->abort_base_->abort_ctx = n->abort_ctx_ptr;
           pa->abort_base_->aborted = true;
+          return true;
         }
       } else if constexpr (detail::HasReturnClause<std::remove_cvref_t<H>,
                                                    ResultT>) {
@@ -820,15 +818,17 @@ struct ScopedHandler {
                     Token{pa, &detail::apply_on_return<Hb, ResultT>,
                           static_cast<void *>(&hh),
                           &detail::extract_result_impl<RawT>, n});
+          return false;
         } else {
           auto val = hh.handle(pa->effect_,
                                Token{pa, &detail::apply_on_return<Hb, ResultT>,
                                      static_cast<void *>(&hh),
                                      &detail::extract_result_impl<RawT>, n});
-          n->abort_storage.owner = n->handler_obj;
-          n->abort_storage.value.emplace(std::move(val));
-          pa->abort_base_->abort_ctx = &n->abort_storage;
+          n->abort_ctx_ptr->owner = n->handler_obj;
+          n->abort_ctx_ptr->value.emplace(std::move(val));
+          pa->abort_base_->abort_ctx = n->abort_ctx_ptr;
           pa->abort_base_->aborted = true;
+          return true;
         }
       } else {
 
@@ -836,13 +836,15 @@ struct ScopedHandler {
         using Ret = decltype(hh.handle(pa->effect_, Token{pa}));
         if constexpr (std::is_void_v<Ret>) {
           hh.handle(pa->effect_, Token{pa});
+          return false;
         } else {
 
           auto val = hh.handle(pa->effect_, Token{pa});
-          n->abort_storage.owner = n->handler_obj;
-          n->abort_storage.value.emplace(std::move(val));
-          pa->abort_base_->abort_ctx = &n->abort_storage;
+          n->abort_ctx_ptr->owner = n->handler_obj;
+          n->abort_ctx_ptr->value.emplace(std::move(val));
+          pa->abort_base_->abort_ctx = n->abort_ctx_ptr;
           pa->abort_base_->aborted = true;
+          return true;
         }
       }
     };
@@ -1097,11 +1099,9 @@ public:
   T _run() {
     auto &h = impl_.h;
     h.resume();
-    while (!h.done()) {
-      auto &p = h.promise();
-      detail::dispatch_effect(p.effect_tag, p.payload_ptr);
-    }
     auto &p = h.promise();
+    while (!h.done())
+      detail::dispatch_effect(p.effect_tag, p.payload_ptr);
 #ifndef FX_NO_EXCEPTIONS
     if (p.exception)
       std::rethrow_exception(p.exception);
@@ -1188,15 +1188,13 @@ public:
   void _run() {
     auto &h = impl_.h;
     h.resume();
+    auto &p = h.promise();
     while (!h.done()) {
-      auto &p = h.promise();
-      detail::dispatch_effect(p.effect_tag, p.payload_ptr);
-      if (h.promise().aborted)
-        return;
+      if (detail::dispatch_effect(p.effect_tag, p.payload_ptr)) return;
     }
 #ifndef FX_NO_EXCEPTIONS
-    if (h.promise().exception)
-      std::rethrow_exception(h.promise().exception);
+    if (p.exception)
+      std::rethrow_exception(p.exception);
 #endif
   }
 };
@@ -1338,8 +1336,7 @@ T resume(Resume<E> k, typename E::result_type v) {
   auto *ab = k.pa->abort_base_;
   k.pa->caller_.resume();
   while (!k.pa->caller_.done()) {
-    detail::dispatch_effect(ab->effect_tag, ab->payload_ptr);
-    if (ab->aborted)
+    if (detail::dispatch_effect(ab->effect_tag, ab->payload_ptr))
       std::terminate();
   }
 #ifndef FX_NO_EXCEPTIONS
@@ -1359,8 +1356,7 @@ T Cont<E, T>::resume(typename E::result_type v) const {
     auto *ab = this->pa->abort_base_;
     this->pa->caller_.resume();
     while (!this->pa->caller_.done()) {
-      detail::dispatch_effect(ab->effect_tag, ab->payload_ptr);
-      if (ab->aborted)
+      if (detail::dispatch_effect(ab->effect_tag, ab->payload_ptr))
         std::terminate();
     }
 #ifndef FX_NO_EXCEPTIONS
