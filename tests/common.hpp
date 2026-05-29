@@ -1,6 +1,5 @@
 #pragma once
 
-
 #include "../effects.hpp"
 
 #include <iostream>
@@ -9,7 +8,6 @@
 #include <vector>
 
 using namespace fx;
-
 
 struct Ask : Effect<std::string> {
   std::string prompt;
@@ -23,15 +21,12 @@ struct Fail : Effect<int> {
   std::string reason;
 };
 
-
 template <typename T> struct Emit : Effect<std::monostate> {
   T value;
 };
 
-
 using IO = Row<Ask, Log>;
 using All = Row<IO, Fail>;
-
 
 struct StdoutLog : Handler<Log> {
   void handle(Log e, auto r) {
@@ -55,7 +50,6 @@ struct FallbackFail : Handler<Fail> {
   int fallback;
   void handle(Fail, auto r) { r(fallback); }
 };
-
 
 struct ScriptedAskCycling : Handler<Ask> {
   std::vector<std::string> answers;
