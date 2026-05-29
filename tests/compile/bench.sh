@@ -31,9 +31,9 @@ LABELS=(
 )
 
 # Extra scenarios (reuse existing files with different flags)
-EXTRA_SRCS=("c4_run.cpp")
-EXTRA_FLAGS=("-DFX_NO_ALLOCATOR")
-EXTRA_LABELS=("c4  .run() -DFX_NO_ALLOCATOR")
+EXTRA_SRCS=("c4_run.cpp" "c4_run.cpp")
+EXTRA_FLAGS=("-DFX_NO_ALLOCATOR" "-DFX_STD_ALLOCATOR")
+EXTRA_LABELS=("c4  .run() -DFX_NO_ALLOCATOR" "c4  .run() -DFX_STD_ALLOCATOR")
 
 time_compile() {
   local file="$1" flags="$2"
