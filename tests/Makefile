@@ -2,11 +2,12 @@ CXX       ?= g++
 CXXFLAGS   = -std=c++23 -Wall -Wextra -O2
 BENCH_CXX  = $(CXX)
 BENCH_FLAGS = -std=c++23 -Wall -Wextra -O3
+REPS      ?= 3
 
 SRCS = $(wildcard t*.cpp)
 BINS = $(SRCS:.cpp=)
 
-.PHONY: all run check-invalid bench clean
+.PHONY: all run check-invalid bench compile-bench compile-report clean
 
 all: $(BINS)
 
@@ -53,5 +54,16 @@ bench: benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 ben
 		echo; \
 	done
 
+compile-bench:
+	@$(MAKE) -C compile bench CXX=$(CXX) REPS=$(REPS)
+
+# Usage: make compile-report FILE=c4_run.cpp
+compile-report:
+	@$(MAKE) -C compile report CXX=$(CXX) FILE=$(FILE)
+
+compile-report-all:
+	@$(MAKE) -C compile report-all CXX=$(CXX)
+
 clean:
 	rm -f $(BINS) benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 benchmarks/b6
+	@$(MAKE) -C compile clean
