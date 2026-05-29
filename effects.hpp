@@ -246,20 +246,27 @@ struct PromiseAbortBase {
 };
 
 struct HandlerNode {
-  const void *effect_tag = nullptr;
-  HandlerNode *prev = nullptr;
   bool (*dispatch)(HandlerNode *, void *) noexcept = nullptr;
   void *handler_obj = nullptr;
   void *real_handler_ptr = nullptr;
   using on_return_any_fn_t = AnyVal (*)(void *, AnyVal &&);
   on_return_any_fn_t on_return_any_fn = nullptr;
   AbortContext *abort_ctx_ptr = nullptr;
+  int stack_idx = -1;
+};
+
+struct HandlerStack {
+  static constexpr int kMaxDepth = 16;
+  int depth = 0;
+  int _pad = 0;
+  const void *tags[kMaxDepth];
+  HandlerNode *nodes[kMaxDepth];
 };
 
 #ifdef FX_NO_TLS
-inline HandlerNode *stack_top = nullptr;
+inline HandlerStack handler_stack_{};
 #else
-inline thread_local HandlerNode *stack_top = nullptr;
+inline thread_local HandlerStack handler_stack_{};
 #endif
 
 
@@ -275,9 +282,12 @@ template <Effectful E> inline constexpr char effect_tag_v = 0;
 
 
 [[gnu::always_inline]] inline bool dispatch_effect(const void *tag, void *payload_ptr) noexcept {
-  for (auto *n = stack_top; n; n = n->prev) {
-    if (n->effect_tag == tag) [[likely]]
+  auto &stk = handler_stack_;
+  for (int i = stk.depth - 1; i >= 0; --i) {
+    if (stk.tags[i] == tag) [[likely]] {
+      auto *n = stk.nodes[i];
       return n->dispatch(n, payload_ptr);
+    }
   }
   std::terminate();
 }
@@ -292,9 +302,10 @@ template <Effectful... Es, typename Handle>
           [&] {
             const void *const tag =
                 &effect_tag_v<std::tuple_element_t<Is, std::tuple<Es...>>>;
-            for (auto *n = stack_top; n; n = n->prev)
-              if (n->effect_tag == tag) {
-                table[Is] = n;
+            auto &stk = handler_stack_;
+            for (int i = stk.depth - 1; i >= 0; --i)
+              if (stk.tags[i] == tag) {
+                table[Is] = stk.nodes[i];
                 break;
               }
           }(),
@@ -768,11 +779,10 @@ template <Effectful E, typename H, typename ResultT = void,
   requires HandlerFor<H, E>
 struct ScopedHandler {
   detail::HandlerNode node;
-  detail::HandlerNode *saved;
+  int saved_depth_;
   detail::AbortContext abort_storage_;
 
   explicit ScopedHandler(H &h, void *group_id = nullptr) noexcept {
-    node.effect_tag = &detail::effect_tag_v<E>;
     node.real_handler_ptr = static_cast<void *>(&h);
 
 
@@ -848,11 +858,14 @@ struct ScopedHandler {
         }
       }
     };
-    saved = detail::stack_top;
-    node.prev = saved;
-    detail::stack_top = &node;
+    auto &stk = detail::handler_stack_;
+    if (stk.depth >= detail::HandlerStack::kMaxDepth) std::terminate();
+    node.stack_idx = stk.depth;
+    stk.tags[stk.depth] = &detail::effect_tag_v<E>;
+    stk.nodes[stk.depth] = &node;
+    saved_depth_ = stk.depth++;
   }
-  ~ScopedHandler() { detail::stack_top = saved; }
+  ~ScopedHandler() { detail::handler_stack_.depth = saved_depth_; }
   ScopedHandler(const ScopedHandler &) = delete;
   ScopedHandler &operator=(const ScopedHandler &) = delete;
 };
@@ -1367,11 +1380,11 @@ T Cont<E, T>::resume(typename E::result_type v) const {
     auto current = extract_fn_(ab->result_ptr);
 
 
-    for (auto *n = detail::stack_top; n != own_node_ && n != nullptr;
-         n = n->prev) {
-      if (n->on_return_any_fn) {
+    auto &stk = detail::handler_stack_;
+    for (int i = stk.depth - 1; i > own_node_->stack_idx; --i) {
+      auto *n = stk.nodes[i];
+      if (n->on_return_any_fn)
         current = n->on_return_any_fn(n->real_handler_ptr, std::move(current));
-      }
     }
     return transform_fn_(transform_ctx_, std::move(current));
   }
