@@ -215,6 +215,59 @@ fx::no_heap guard;
 my_computation().run(handler);   // throws if any allocation occurs
 ```
 
+### `fx::frame_size_v<FxType>`
+
+Compile-time constant equal to the exact number of bytes that `promise_type::operator new` will request when constructing `FxType`. Use this instead of guessing when sizing a `ScopedFreeList` or verifying frame budgets.
+
+```cpp
+using MyFx = fx::Fx<int, Ask, Log>;
+static_assert(fx::frame_size_v<MyFx> <= 512);
+
+fx::ScopedFreeList<fx::frame_size_v<MyFx>, 2> pool;
+auto result = my_computation().run(handler);
+```
+
+Defined as `sizeof(FxType::promise_type) + sizeof(MemResource*)`.
+
+### `fx::StackFx<FxType, Capacity = 1>`
+
+A stack-local coroutine wrapper with inline frame storage. Embeds a `FreeListResource<frame_size_v<FxType>, Capacity>` as a member so the coroutine frame is allocated from a buffer that lives on the caller's stack — no heap allocation, no frame-size guessing, no ordering mistakes.
+
+```cpp
+class StackFx<FxType, Capacity> {
+public:
+    // Constructs by invoking factory() after installing the internal allocator.
+    template <typename Factory>
+    explicit StackFx(Factory&& f);
+
+    // Delegates to FxType::run — all handlers are forwarded.
+    template <typename... Hs>
+    auto run(Hs&&... handlers);
+
+    // Non-copyable, non-movable (coroutine handle points into embedded storage).
+};
+```
+
+`Capacity = 1` is correct for a single coroutine. Set it higher when the computation `co_await`s inner `Fx` objects that overlap the outer coroutine's lifetime.
+
+A CTAD deduction guide resolves `FxType` from the factory's return type:
+
+```cpp
+fx::StackFx sfx{my_computation};  // FxType deduced
+auto result = sfx.run(MyHandler{});
+```
+
+### `fx::make_stack_fx(factory)`
+
+Factory helper for `StackFx`. Returns a `StackFx<invoke_result_t<Factory>>` with the frame storage already on the stack.
+
+```cpp
+// One-liner, zero heap:
+auto result = fx::make_stack_fx(my_computation).run(MyHandler{});
+```
+
+The returned temporary is guaranteed to be constructed in-place (C++17 prvalue elision), so this composes safely even without a named variable.
+
 ---
 
 ## Macros
@@ -243,6 +296,8 @@ Define any of these before `#include "effects.hpp"`:
 | `FX_NO_TLS` | undefined | Replace `thread_local` storage with plain globals (for single-threaded embedded targets) |
 | `FX_NO_EXCEPTIONS` | undefined | Strip `exception_ptr` from promise types; replace `unhandled_exception()` with `std::terminate()`. Saves 8 bytes per coroutine frame |
 | `FX_SMALL_ANY_SIZE` | `48` | Override inline buffer size (bytes) for `SmallAny`. Increase if `on_return` result types exceed 48 bytes |
+| `FX_NO_ALLOCATOR` | undefined | Remove all PMR allocator machinery. Any attempt to construct an `Fx` coroutine frame calls `std::terminate()`. Use when you want a hard compile-boundary guarantee that no frame ever reaches any allocator |
+| `FX_STD_ALLOCATOR` | undefined | Use `std::pmr::memory_resource` as `MemResource` instead of the built-in lightweight equivalent. Enables direct interop with `<memory_resource>` types |
 
 ---
 

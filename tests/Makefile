@@ -26,6 +26,8 @@ benchmarks/b5: benchmarks/b5_propagation.cpp benchmarks/bench.hpp common.hpp ../
 	$(BENCH_CXX) $(BENCH_FLAGS) -o $@ $<
 benchmarks/b6: benchmarks/b6_allocators.cpp benchmarks/bench.hpp common.hpp ../effects.hpp
 	$(BENCH_CXX) $(BENCH_FLAGS) -o $@ $<
+benchmarks/b7: benchmarks/b7_stack_alloc.cpp benchmarks/bench.hpp common.hpp ../effects.hpp
+	$(BENCH_CXX) $(BENCH_FLAGS) -o $@ $<
 
 run: all
 	@for t in $(BINS); do \
@@ -47,8 +49,8 @@ check-invalid:
 	done; \
 	echo "$$pass correctly rejected, $$fail unexpected successes."
 
-bench: benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 benchmarks/b6
-	@for b in benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 benchmarks/b6; do \
+bench: benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 benchmarks/b6 benchmarks/b7
+	@for b in benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 benchmarks/b6 benchmarks/b7; do \
 		printf '\033[1m--- %s ---\033[0m\n' "$$b"; \
 		./$$b; \
 		echo; \
@@ -65,5 +67,5 @@ compile-report-all:
 	@$(MAKE) -C compile report-all CXX=$(CXX)
 
 clean:
-	rm -f $(BINS) benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 benchmarks/b6
+	rm -f $(BINS) benchmarks/b1 benchmarks/b2 benchmarks/b3 benchmarks/b4 benchmarks/b5 benchmarks/b6 benchmarks/b7
 	@$(MAKE) -C compile clean

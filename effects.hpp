@@ -704,6 +704,9 @@ template <typename... Es> struct PromiseBase : PromiseAbortBase {
     else
       ::operator delete(ptr, total);
   }
+#else
+  [[noreturn]] static void *operator new(std::size_t) { std::terminate(); }
+  static void operator delete(void *, std::size_t) noexcept {}
 #endif
 
   template <Effectful Eff>
@@ -1286,6 +1289,78 @@ auto Fx<void, Es...>::bind(Hs &&...hs) {
   return BoundFx<Fx<void, Es...>, std::decay_t<Hs>...>{
       std::move(*this), std::make_tuple(std::forward<Hs>(hs)...)};
 }
+
+#ifndef FX_NO_ALLOCATOR
+
+// Compile-time frame slot size for FxType.
+// Equals the exact number of bytes that promise_type::operator new requests,
+// making it safe to use as the BlockSize for a ScopedFreeList or StackFx.
+template <typename FxType>
+inline constexpr std::size_t frame_size_v =
+    sizeof(typename FxType::promise_type) + sizeof(MemResource *);
+
+// StackFx<FxType, Capacity> — coroutine with inline stack-resident frame storage.
+//
+// Embeds a FreeListResource<frame_size_v<FxType>, Capacity> as a data member
+// so the coroutine frame lives on the caller's stack with no heap allocation.
+// The ScopedAllocator is installed before FxType is constructed (C++ member
+// initialisation order), making the guarantee automatic and unbreakable.
+//
+// The pool's overflow fallback is the allocator that was active at StackFx
+// construction time. If no_heap is installed before constructing StackFx, any
+// overflow (wrong Capacity) will terminate rather than silently heap-allocate.
+//
+// Capacity=1 (default) is correct for a single coroutine; use Capacity>1 when
+// the computation co_awaits inner Fx objects before the outer one completes.
+//
+// Non-copyable and non-movable: the coroutine handle points into the embedded
+// pool storage, so the object must not be relocated after construction.
+//
+// Typical use — one-liner via make_stack_fx:
+//   auto result = fx::make_stack_fx(my_computation).run(MyHandler{});
+//
+// Named variable (also works; guaranteed copy elision constructs in-place):
+//   fx::StackFx sfx{my_computation};
+//   auto result = sfx.run(MyHandler{});
+template <typename FxType, std::size_t Capacity = 1>
+class StackFx {
+  static constexpr std::size_t kBlock = frame_size_v<FxType>;
+  FreeListResource<kBlock, Capacity> mr_;
+  ScopedAllocator alloc_;
+  FxType fx_;
+
+public:
+  template <typename Factory>
+  explicit StackFx(Factory &&f)
+      : mr_(detail::effective_mr()), alloc_(mr_),
+        fx_(std::forward<Factory>(f)()) {}
+
+  StackFx(const StackFx &) = delete;
+  StackFx &operator=(const StackFx &) = delete;
+  StackFx(StackFx &&) = delete;
+  StackFx &operator=(StackFx &&) = delete;
+
+  template <typename... Hs>
+  auto run(Hs &&...hs) {
+    return fx_.run(std::forward<Hs>(hs)...);
+  }
+};
+
+template <typename Factory>
+StackFx(Factory &&) -> StackFx<std::invoke_result_t<std::decay_t<Factory>>>;
+
+// make_stack_fx(factory) — construct a StackFx from a zero-argument callable.
+// The factory is invoked after the internal allocator is installed, so the
+// coroutine frame is guaranteed to land on the caller's stack.
+//
+//   auto result = fx::make_stack_fx(my_computation).run(handler);
+template <typename Factory>
+auto make_stack_fx(Factory &&f) {
+  using FxType = std::invoke_result_t<std::decay_t<Factory>>;
+  return StackFx<FxType>{std::forward<Factory>(f)};
+}
+
+#endif // FX_NO_ALLOCATOR
 
 template <Effectful E> struct [[nodiscard]] PerformAwaitable {
   explicit PerformAwaitable(E e) : effect_(std::move(e)) {}

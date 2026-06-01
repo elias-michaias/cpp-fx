@@ -120,10 +120,6 @@ Each level adds ~16 ns — one coroutine frame allocation plus a suspend/resume.
 
 Effect dispatch uses a compile-time index (`effect_index`, a `uint8_t` stored in `PromiseAbortBase`) set at `await_suspend` time. When `.run()` starts, it builds a small stack-local dispatch table (`HandlerNode*[sizeof...(Es)]`). Each `perform()` indexes directly into this table — O(1) regardless of how many effects are declared.
 
-## Compiler frame elision (HALO)
-
-GCC and Clang can sometimes stack-allocate coroutine frames when they can prove the frame doesn't escape (`-O2`/`-O3`). This eliminates the frame allocation entirely. The library is written to encourage this where possible (frames are always tied to an `Fx` value on the stack), but HALO is not guaranteed. Wrapping with `ScopedArena` or `ScopedFreeList` is the reliable alternative for heap-less invariants.
-
 ---
 
 ## Heap-less strategies in depth
@@ -134,7 +130,7 @@ This section explains the full allocation model and shows concrete code patterns
 
 | Site | When | Size | Avoidable? |
 |------|------|------|------------|
-| Coroutine frame | Once per `Fx<T>` construction | ~200–400 B | ✅ via HALO or arena |
+| Coroutine frame | Once per `Fx<T>` construction | ~200–400 B | ✅ via `StackFx` or arena |
 | `PerformAwaitable<E>` | Lives *inside* the frame | 0 extra | — (already free) |
 | `AbortContext` / `SmallAny` | Only on abort path | stack-local | — (already free) |
 | `on_return` FIFO chain | Compile-time depth, inline | 0 extra | — (already free) |
@@ -247,31 +243,76 @@ int main() {
 }
 ```
 
-### Sizing the frame slot
+### Strategy 7 — `FX_NO_ALLOCATOR` (hard no-heap compile boundary)
 
-The coroutine frame size is compiler-dependent but typically 200–400 bytes for simple effects. To measure it precisely, check the output of `b6` or print `sizeof` the promise type:
+`FX_NO_ALLOCATOR` strips all PMR allocator machinery from the header and replaces `promise_type::operator new` with a call to `std::terminate()`. Any attempt to construct an `Fx` coroutine frame will terminate immediately. Use it as a compile-time assertion that a translation unit (or whole binary) never allocates a coroutine frame at runtime, regardless of what allocator happens to be active.
+
+This is a stronger guarantee than `no_heap` (which is a runtime assertion) — with `FX_NO_ALLOCATOR` the termination path is always taken, not just when the runtime check fires.
 
 ```cpp
-// In a translation unit that includes effects.hpp:
-using MyPromise = fx::Fx<int, Ask, Log>::promise_type;
-static_assert(sizeof(MyPromise) <= 512, "frame larger than expected");
+#define FX_NO_ALLOCATOR
+#include "effects.hpp"
+// StackFx, ScopedArena, FreeListResource, etc. are not available.
+// Every Fx construction will std::terminate() if reached.
 ```
 
-A rule of thumb for `ScopedFreeList<BlockSize, ...>`:
+Because the allocator types are removed, `StackFx` and `ScopedArena` are not available under `FX_NO_ALLOCATOR`. This flag is intended for contexts where you need to guarantee at the binary level that no frame ever gets allocated — for example, a safety-critical component that must never reach any allocator code path.
 
-```
-BlockSize = round_up_to_power_of_2(sizeof(promise_type) + sizeof(void*))
+### Sizing the frame slot
+
+The coroutine frame size is compiler-dependent but typically 200–400 bytes for simple effects. Use `fx::frame_size_v<FxType>` for the exact value instead of guessing:
+
+```cpp
+using MyFx = fx::Fx<int, Ask, Log>;
+static_assert(fx::frame_size_v<MyFx> <= 512, "frame larger than expected");
+
+// Exact-fit free-list pool using frame_size_v:
+fx::ScopedFreeList<fx::frame_size_v<MyFx>, 2> pool;
+auto result = my_computation().run(handler);
 ```
 
-The extra `sizeof(void*)` accounts for the allocator pointer stored by `PromiseBase::operator new` to find the right `memory_resource` at deallocation time.
+`frame_size_v<FxType>` equals `sizeof(FxType::promise_type) + sizeof(void*)` — the exact byte count that `promise_type::operator new` requests (the extra pointer stores the allocator address for deallocation).
+
+### Strategy 7 — `StackFx` and `make_stack_fx` (guaranteed stack placement)
+
+`StackFx<FxType, Capacity>` is a way to gurantee ahead-of-time that everything is stack-allocated. It bundles the storage, the allocator, and the coroutine into one stack-local object with zero setup. The frame goes into an inline `FreeListResource` inside the `StackFx` value — which lives on the caller's stack — with no heap allocation, no frame-size guessing, and no ordering mistakes possible.
+
+```cpp
+// One-liner — zero heap, no setup, no guessing:
+auto result = fx::make_stack_fx(my_computation).run(MyHandler{});
+
+// Named variable — also zero heap (guaranteed copy elision constructs in-place):
+fx::StackFx sfx{my_computation};
+auto result = sfx.run(MyHandler{});
+```
+
+Use `Capacity > 1` when the computation `co_await`s inner `Fx` objects that complete before the outer coroutine returns (each live frame needs a pool slot):
+
+```cpp
+// Inner coroutine is awaited before outer returns — needs 2 slots
+fx::StackFx<decltype(outer()), 2> sfx{outer};
+auto result = sfx.run(handler);
+```
+
+`StackFx` is non-copyable and non-movable because the coroutine handle points into the embedded pool storage. Pair with `no_heap` in tests to assert the guarantee holds end-to-end:
+
+```cpp
+fx::no_heap guard;   // fallback is now null_resource — any spill terminates
+auto result = fx::make_stack_fx(my_computation).run(MyHandler{});
+```
+
+Obviously, this is not going to be a standard solution (since usually effectful functions call other effectful functions) but this is theoretically the most performant when amortized.
 
 ### Choosing a strategy
 
 | Situation | Recommended strategy |
 |-----------|---------------------|
 | General use, performance not critical | Default TLS slab (do nothing) |
-| Tight loop, one coroutine at a time | `ScopedFreeList<BlockSize, 2>` outside the loop |
+| Zero heap, single expression | `make_stack_fx(factory).run(handler)` |
+| Zero heap, named variable | `fx::StackFx sfx{factory}; sfx.run(handler)` |
+| Tight loop, one coroutine at a time | `ScopedFreeList<frame_size_v<FxT>, 2>` outside the loop |
 | Bounded scope, multiple coroutines | `ScopedArena<N>` around the scope |
 | Integration with existing PMR allocator | `ScopedAllocator{your_resource}` |
-| Hard "no heap" invariant | `ScopedArena` + `no_heap` guard |
+| Hard "no heap" invariant | `StackFx` or `ScopedArena` + `no_heap` guard |
 | No thread-local storage (embedded) | `FX_NO_TLS` + explicit `ScopedFreeList` or `ScopedArena` |
+| Assert no heap at compile boundary | `FX_NO_ALLOCATOR` (terminates on any frame alloc) |
