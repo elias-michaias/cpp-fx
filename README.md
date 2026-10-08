@@ -1,6 +1,33 @@
-# cpp-fx
+<p align="center">
+  <h1 align="center">cpp-fx</h1>
+  <p align="center">A single-header algebraic effects library for C++23.</p>
+</p>
 
-A single-header algebraic effects library for C++23.
+<p align="center">
+  <img src="https://img.shields.io/badge/implementation-header--only-brightgreen" alt="header-only">
+  <img src="https://img.shields.io/badge/standard-C%2B%2B23-blue" alt="C++23">
+  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+  <a href="https://github.com/elias-michaias/cpp-fx"><img src="https://img.shields.io/github/stars/elias-michaias/cpp-fx?style=social" alt="GitHub stars"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#documentation">Documentation</a> &bull;
+  <a href="docs/api-reference.md">API Reference</a> &bull;
+  <a href="#overview">Overview</a> &bull;
+  <a href="#tests">Tests</a>
+</p>
+
+<p align="center">
+  <a href="https://www.emskeirik.dev/blog/algebraic-effects-in-cpp/#gh-dark-mode-only" target="_blank" rel="noopener noreferrer">
+    <img src="docs/assets/article-button-dark.svg" width="280" height="60" alt="Read the article here!">
+  </a>
+  <a href="https://www.emskeirik.dev/blog/algebraic-effects-in-cpp/#gh-light-mode-only" target="_blank" rel="noopener noreferrer">
+    <img src="docs/assets/article-button-light.svg" width="280" height="60" alt="Read the article here!">
+  </a>
+</p>
+
+---
 
 Effects let you write effectful code — I/O, failure, logging, async, generators — in a direct style, while keeping the *implementation* of those effects completely separate from the code that performs them. Handlers are swappable at the call site without changing the coroutine body.
 
@@ -139,4 +166,4 @@ make bench        # run all benchmarks (O3)
 
 ## License
 
-MIT
+[MIT](LICENSE.md)
